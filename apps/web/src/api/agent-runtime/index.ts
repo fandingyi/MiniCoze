@@ -109,6 +109,8 @@ export type RuntimeEvent =
 
 
 export interface RunAgentParams {
+  /** Reuse only for the same logical request. */
+  idempotencyKey?: string;
   agentId: string;
   message: string;
   conversationId?: string;
@@ -148,6 +150,7 @@ export async function runAgentStream(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      'Idempotency-Key': params.idempotencyKey ?? crypto.randomUUID(),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify({

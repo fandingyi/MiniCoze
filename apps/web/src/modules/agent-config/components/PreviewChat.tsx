@@ -334,58 +334,6 @@ export function PreviewChat({
               abortRef.current = null
               break
 
-            case 'run.failed':
-              sendingRef.current = false
-              setSending(false)
-              abortRef.current = null
-              break
-
-            case 'run.in_progress':
-              break
-
-            case 'tool.call.created': {
-              const params = event.args && typeof event.args === 'object' && !Array.isArray(event.args)
-                ? event.args as Record<string, unknown>
-                : { value: event.args }
-              setMessages((prev) => [
-                ...prev,
-                {
-                  id: `tool-${event.toolCallId}`,
-                  text: '',
-                  sender: 'agent',
-                  time: timeStr,
-                  toolCall: {
-                    callId: event.toolCallId,
-                    toolName: event.name,
-                    params,
-                    status: 'running',
-                    startedAt: new Date().toISOString(),
-                  },
-                },
-              ])
-              break
-            }
-
-            case 'tool.call.completed':
-              setMessages((prev) =>
-                prev.map((m) =>
-                  m.id === `tool-${event.toolCallId}` && m.toolCall
-                    ? {
-                        ...m,
-                        toolCall: {
-                          ...m.toolCall,
-                          toolName: event.name,
-                          status: 'success',
-                          result: event.result,
-                          finishedAt: new Date().toISOString(),
-                        },
-                      }
-                    : m
-                )
-              )
-              break
-
-
             default:
               break
           }

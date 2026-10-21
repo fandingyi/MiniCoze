@@ -11,6 +11,7 @@ import { AppLayout } from '../modules/layout/AppLayout';
 
 // ── 懒加载页面组件 ──
 const LoginPage = lazy(() => import('../modules/auth').then(m => ({ default: m.LoginPage })));
+const PublicAgentPage = lazy(() => import('../modules/public-agent/PublicAgentPage'));
 const RegisterPage = lazy(() => import('../modules/auth').then(m => ({ default: m.RegisterPage })));
 const WelcomePage = lazy(() => import('../modules/welcome').then(m => ({ default: m.WelcomePage })));
 const DashboardPage = lazy(() => import('../modules/homepage').then(m => ({ default: m.DashboardPage })));
@@ -73,6 +74,8 @@ export function AppRoutes() {
     <BrowserRouter>
       <ErrorBoundary>
       <Routes>
+        <Route path="/share/agents/:slug" element={withSuspense(PublicAgentPage)} />
+        <Route path="/embed/agents/:slug" element={withSuspense(PublicAgentPage)} />
         <Route path="/" element={<RootRedirect />} />
         <Route
           path="/welcome"

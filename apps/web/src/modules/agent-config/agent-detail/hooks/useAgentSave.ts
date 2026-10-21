@@ -25,7 +25,7 @@ interface UseAgentSaveOptions {
 function collectPluginIds(config: OrchestrationConfig): string[] {
   const ids = new Set<string>();
   for (const section of [config.planner, config.flow, config.multi]) {
-    if (section?.plugins) {
+    if (section && 'plugins' in section && section.plugins) {
       for (const id of section.plugins) {
         ids.add(id);
       }

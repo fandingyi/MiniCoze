@@ -1,10 +1,15 @@
 import type { Response } from 'express';
 import type { RuntimeEvent } from '../../shared/types/agent';
+import {
+  RuntimeEventEncoder,
+  serializeRuntimeSse,
+} from './runtime-event-contract';
 
 export async function writeRuntimeEventStream(
   res: Response,
   events: AsyncIterable<RuntimeEvent>,
 ): Promise<void> {
+  const encoder = new RuntimeEventEncoder();
   try {
     const iterator = events[Symbol.asyncIterator]();
     const first = await iterator.next();
@@ -19,8 +24,7 @@ export async function writeRuntimeEventStream(
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
-    res.write(`event: ${first.value.type}\n`);
-    res.write(`data: ${JSON.stringify(first.value)}\n\n`);
+    res.write(serializeRuntimeSse(encoder.encode(first.value)));
 
     for (;;) {
       const next = await iterator.next();
@@ -28,8 +32,7 @@ export async function writeRuntimeEventStream(
         break;
       }
 
-      res.write(`event: ${next.value.type}\n`);
-      res.write(`data: ${JSON.stringify(next.value)}\n\n`);
+      res.write(serializeRuntimeSse(encoder.encode(next.value)));
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

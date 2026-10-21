@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "test:public": "node --test scripts/public-stream.test.mjs",
     "dev": "vite --host 0.0.0.0 --mode development",
     "build": "tsc -b && vite build --mode production",
     "preview": "vite preview --host 0.0.0.0 --mode production",

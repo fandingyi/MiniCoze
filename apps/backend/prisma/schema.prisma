@@ -311,6 +311,7 @@ model Conversation {
   agent        Agent         @relation(fields: [agentId], references: [id], onDelete: Cascade)
   user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
   messages     Message[]
+  agentRuns    AgentRun[]
   workflowRuns WorkflowRun[]
 
   @@index([agentId])
@@ -328,12 +329,83 @@ model Message {
   tokenUsage     Json?
   errorMessage   String?     @db.Text
   createdAt      DateTime    @default(now())
+  runId          String?
 
   conversation Conversation  @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  run          AgentRun?     @relation(fields: [runId], references: [id], onDelete: SetNull)
   workflowRuns WorkflowRun[]
 
   @@index([conversationId])
   @@index([conversationId, createdAt])
+  @@unique([runId, role])
+}
+
+enum AgentRunStatus {
+  CREATED
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+model AgentRun {
+  id             String         @id
+  conversationId String
+  agentId        String
+  userId         String
+  workspaceId    String
+  requestKey     String
+  requestHash    String
+  mode           String
+  agentVersionId String?
+  snapshot       Json
+  history        Json
+  inputText      String         @db.Text
+  status         AgentRunStatus @default(CREATED)
+  usage          Json?
+  errorCode      String?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  startedAt      DateTime?
+  finishedAt     DateTime?
+  deadlineAt     DateTime
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  messages     Message[]
+  toolCalls    AgentToolCall[]
+  modelRounds  AgentModelRound[]
+
+  @@unique([userId, requestKey])
+  @@index([conversationId, createdAt])
+  @@index([status, deadlineAt])
+  // Migration additionally creates a partial unique index for one active run
+  // per conversation and a trigger protecting snapshot/terminal immutability.
+}
+
+model AgentModelRound {
+  runId        String
+  round        Int
+  durationMs   Int
+  finishReason String
+  usage        Json?
+  run AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@id([runId, round])
+}
+
+model AgentToolCall {
+  runId       String
+  callId      String
+  name        String
+  requestHash String
+  arguments   Json
+  status      String
+  output      Json
+  errorCode   String
+  createdAt   DateTime @default(now())
+  run AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@id([runId, callId])
 }
 
 model Workflow {

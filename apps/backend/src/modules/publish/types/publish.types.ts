@@ -68,6 +68,7 @@ export interface OfflineAgentResponse {
 }
 
 export interface AgentPublishSnapshot {
+  knowledge?: Array<{ knowledgeBaseId: string; name: string; enabled: boolean }>;
   agent: {
     id: string;
     workspaceId: string;

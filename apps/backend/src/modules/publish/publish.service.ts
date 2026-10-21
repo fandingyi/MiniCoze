@@ -32,6 +32,7 @@ import {
 
 type PublishAgent = Prisma.AgentGetPayload<{
   include: {
+    knowledgeBaseBindings: { include: { knowledgeBase: true } };
     workflows: {
       include: {
         workflow: true;
@@ -338,6 +339,7 @@ export class PublishService {
     const agent = await this.prisma.agent.findUnique({
       where: { id: agentId },
       include: {
+        knowledgeBaseBindings: { include: { knowledgeBase: true } },
         workflows: {
           include: {
             workflow: true,
@@ -481,6 +483,11 @@ export class PublishService {
         openingMessage: agent.openingMessage,
         contextLimit: agent.contextLimit,
       },
+      knowledge: agent.knowledgeBaseBindings.map((binding) => ({
+        knowledgeBaseId: binding.knowledgeBaseId,
+        name: binding.knowledgeBase.name,
+        enabled: binding.enabled && binding.knowledgeBase.status === 'ACTIVE',
+      })),
       workflows: agent.workflows.map((binding) => ({
         bindingId: binding.id,
         workflowId: binding.workflowId,
