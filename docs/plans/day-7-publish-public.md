@@ -85,7 +85,7 @@ Python：在 `apps/agent-runtime-python` 运行 `.venv/Scripts/python.exe -m pyt
 - **验证**：Go 全套回归（临时 PostgreSQL + 实际 Python）及 vet 通过；前端 4 项 SSE 测试通过；tsc -b 与 Vite 生产构建通过。Vite 仍提示已有 vendor chunk 超过 500 kB，本轮未调整全站拆包。
 - **浏览器验收**：使用本地 UI fixture 验证分享页收发、断流提示、同请求重试、停止后恢复输入、新会话清空消息、嵌入页匿名加载；这是模拟接口的 UI 验收，不是生产端到端测试。
 
-前端测试：在 apps/web 运行 `node --test scripts/public-stream.test.mjs`；重现 UI 验收可运行 `node scripts/public-ui-fixture.mjs`，访问 `http://127.0.0.1:5187/share/agents/fixture`。输入“断线”模拟首次断流后同键重放，输入“等待”模拟可停止的慢响应。此 fixture 仅绑定本机，不连接数据库或模型。
+前端测试：在 apps/web 运行 `node --test scripts/public-stream.test.mjs`；重现 UI 验收可运行 `node scripts/public-ui-fixture.mjs`，访问 `http://127.0.0.1:5187/share/agents/fixture`。输入“断线”模拟断流后查询原运行恢复回答，输入“等待”模拟可停止的慢响应。此 fixture 仅绑定本机，不连接数据库或模型。最新访客会话请求头、恢复策略及渠道并发配置见 [聊天可靠性补充](chat-reliability.md)。
 
 本机 npm 启动器路径缺失，本次直接运行已安装的工具完成等价构建：`node node_modules/typescript/bin/tsc -b --pretty false`，随后 `node node_modules/vite/bin/vite.js build --mode production`。
 

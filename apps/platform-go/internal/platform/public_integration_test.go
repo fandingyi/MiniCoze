@@ -68,7 +68,9 @@ func testPublishedPublic(t *testing.T, store Postgres) {
 	}))
 	defer upstream.Close()
 	mux := AuthHandler(auth)
-	if err := RegisterPersistentRuns(mux, auth, store, upstream.URL, "test-runtime-service-token-32-characters"); err != nil {
+	options := DefaultRunOptions()
+	options.MaxPerChannel = 1
+	if err := RegisterPersistentRunsWithOptions(mux, auth, store, upstream.URL, "test-runtime-service-token-32-characters", options); err != nil {
 		t.Fatal(err)
 	}
 	if err := RegisterPublicRoutes(mux, store, "test-public-session-secret-32-characters", false); err != nil {
@@ -79,6 +81,7 @@ func testPublishedPublic(t *testing.T, store Postgres) {
 		r := httptest.NewRequest(method, path, strings.NewReader(body))
 		if cookie != nil {
 			r.AddCookie(cookie)
+			r.Header.Set("X-Visitor-Session", digest("web:web7:"+strings.Split(cookie.Value, ".")[0]))
 		}
 		r.Header.Set("Idempotency-Key", key)
 		if bearer != "" {
@@ -135,13 +138,26 @@ func testPublishedPublic(t *testing.T, store Postgres) {
 	}
 	tampered := *a
 	tampered.Value += "x"
-	if w := request("GET", query, "", "", &tampered, ""); w.Code != 404 {
+	if w := request("GET", query, "", "", &tampered, ""); w.Code != 401 {
 		t.Fatal("tampered cookie", w.Code)
 	}
 	if w := request("POST", path, "override-key", `{"message":"hello","preview":true}`, a, ""); w.Code != 400 {
 		t.Fatal("public override accepted", w.Code)
 	}
 	apiPath := "/api/public/agent-runs/stream"
+	beforeLostSession := calls.Load()
+	if w := request("POST", path, "public-same-key", `{"message":"hello"}`, nil, ""); w.Code != 401 || len(w.Result().Cookies()) != 0 {
+		t.Fatal("missing session recreated on retry", w.Code)
+	}
+	stale := httptest.NewRequest("POST", path, strings.NewReader(`{"message":"hello"}`))
+	stale.AddCookie(b)
+	stale.Header.Set("Idempotency-Key", "public-same-key")
+	stale.Header.Set("X-Visitor-Session", digest("web:web7:"+strings.Split(a.Value, ".")[0]))
+	staleResponse := httptest.NewRecorder()
+	mux.ServeHTTP(staleResponse, stale)
+	if staleResponse.Code != 401 || calls.Load() != beforeLostSession {
+		t.Fatal("changed session repeated execution")
+	}
 	apiRun := request("POST", apiPath, "api-visitor-lifecycle", `{"message":"api lifecycle","visitorId":"customer-a"}`, nil, "test-api-key-day-seven")
 	apiID := apiRun.Header().Get("X-Run-Id")
 	if apiRun.Code != 200 || !strings.HasSuffix(apiRun.Header().Get("Location"), "?visitorId=customer-a") {
@@ -178,6 +194,15 @@ func testPublishedPublic(t *testing.T, store Postgres) {
 		t.Fatal(activeError)
 	}
 	activeID := activeResponse.Header.Get("X-Run-Id")
+	if w := request("POST", apiPath, "limited-channel-request", `{"message":"limited"}`, nil, "test-api-key-day-seven"); w.Code != 429 || w.Header().Get("Retry-After") != "1" {
+		t.Fatal("per-channel admission", w.Code)
+	}
+	if w := request("POST", path, "other-channel-progress", `{"message":"other channel"}`, a, ""); w.Code != 200 {
+		t.Fatal("other channel starved", w.Code)
+	}
+	if w := request("GET", "/api/public/agent-runs/"+activeID+"?visitorId=customer-a", "", "", nil, "test-api-key-day-seven"); w.Code != 200 {
+		t.Fatal("query blocked by admission", w.Code)
+	}
 	if w := request("POST", "/api/public/agent-runs/"+activeID+"/cancel?visitorId=customer-a", "", "", nil, "test-api-key-day-seven"); w.Code != 200 {
 		t.Fatal("active API cancel", w.Code, w.Body.String())
 	}

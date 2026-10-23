@@ -17,14 +17,18 @@ type RunOptions struct {
 	Timeout       time.Duration
 	PollInterval  time.Duration
 	MaxConcurrent int
+	MaxPerChannel int
 	Lifecycle     context.Context
 	Logger        *slog.Logger
 }
 
 func DefaultRunOptions() RunOptions {
-	return RunOptions{120 * time.Second, time.Second, 32, context.Background(), slog.Default()}
+	return RunOptions{120 * time.Second, time.Second, 32, 4, context.Background(), slog.Default()}
 }
 func (o RunOptions) validate() error {
+	if o.MaxPerChannel < 1 || o.MaxPerChannel > 256 {
+		return errors.New("invalid per-channel concurrency limit")
+	}
 	if o.Timeout < 100*time.Millisecond || o.Timeout > 120*time.Second || o.PollInterval < 10*time.Millisecond || o.PollInterval > 5*time.Second || o.MaxConcurrent < 1 || o.MaxConcurrent > 256 || o.Lifecycle == nil || o.Logger == nil {
 		return errors.New("invalid run lifecycle options")
 	}

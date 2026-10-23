@@ -1,6 +1,6 @@
 import { API_BASE_URL } from './http';
 
-export interface PublicAgentInfo { name: string; description: string | null; openingMessage: string | null; persistedRuns?: boolean }
+export interface PublicAgentInfo { name: string; description: string | null; openingMessage: string | null; persistedRuns?: boolean; sessionId?: string }
 export interface PublicEvent { type: string; runId?: string; conversationId?: string; content?: string; error?: string }
 export const publicAgentURL = (slug: string) => `${API_BASE_URL.replace(/\/$/, '')}/public/agents/${encodeURIComponent(slug)}`;
 

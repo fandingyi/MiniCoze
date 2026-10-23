@@ -185,6 +185,7 @@ export function PreviewChat({
     setKnowledgeDismissed(false)
     toolCallStartRef.current.clear()
 
+    const execution = { id: "", usage: null as TokenUsage | null, tools: [] as ToolCallData[], started: performance.now() }
     runAgentStream(
       {
         agentId,
@@ -201,6 +202,7 @@ export function PreviewChat({
           switch (event.type) {
             case 'run.created':
               setConversationId(event.conversationId)
+              execution.id = event.runId
               setCurrentRunId(event.runId)
               break
 
@@ -228,7 +230,7 @@ export function PreviewChat({
               setMessages((prev) =>
                 prev.map((m) =>
                   m.kind === 'message' && m.id === agentMsgId
-                    ? { ...m, text: event.content, id: event.messageId, status: 'success' as const }
+                    ? { ...m, text: event.content, status: 'success' as const }
                     : m
                 )
               )
@@ -243,7 +245,8 @@ export function PreviewChat({
                 args: tcEvent.args,
                 status: 'executing',
               }
-              setCurrentToolCalls((prev) => [...prev, toolData])
+              execution.tools.push(toolData)
+              setCurrentToolCalls([...execution.tools])
               const toolMsg: ToolCallMessage = {
                 id: `tc-${tcEvent.toolCallId}`,
                 kind: 'tool-call',
@@ -254,6 +257,7 @@ export function PreviewChat({
               break
             }
 
+            case 'tool.call.failed':
             case 'tool.call.completed': {
               const tcDone = event as ToolCallCompletedEvent
               const startTime = toolCallStartRef.current.get(tcDone.toolCallId)
@@ -261,15 +265,14 @@ export function PreviewChat({
               const updatedTool: ToolCallData = {
                 toolCallId: tcDone.toolCallId,
                 name: tcDone.name,
-                args: tcDone.result ? undefined : undefined, // args already shown in created
+                args: execution.tools.find(tc => tc.toolCallId === tcDone.toolCallId)?.args,
                 result: tcDone.result,
                 error: tcDone.error,
                 status: tcDone.error ? 'failed' : 'success',
                 duration,
               }
-              setCurrentToolCalls((prev) =>
-                prev.map((tc) => tc.toolCallId === tcDone.toolCallId ? updatedTool : tc)
-              )
+              execution.tools = execution.tools.map(tc => tc.toolCallId === tcDone.toolCallId ? updatedTool : tc)
+              setCurrentToolCalls([...execution.tools])
               setMessages((prev) =>
                 prev.map((m) =>
                   m.kind === 'tool-call' && m.toolData.toolCallId === tcDone.toolCallId
@@ -297,7 +300,8 @@ export function PreviewChat({
             case 'run.completed': {
               const rc = event as RunCompletedEvent
               setCurrentLatency(0) // 会在 stream.done 中计算
-              if (rc.usage) setCurrentUsage(rc.usage)
+              execution.usage = rc.usage ?? null
+              setCurrentUsage(execution.usage)
               break
             }
 
@@ -316,15 +320,15 @@ export function PreviewChat({
 
             case 'stream.done':
               // 添加调试信息面板
-              if (currentToolCalls.length > 0 || currentRunId) {
+              if (execution.tools.length > 0 || execution.id) {
                 const debugMsg: DebugMessage = {
                   id: `debug-${Date.now()}`,
                   kind: 'debug',
-                  runId: currentRunId,
+                  runId: execution.id,
                   model: model || 'unknown',
-                  latency: 0,
-                  usage: currentUsage,
-                  toolCalls: currentToolCalls,
+                  latency: Math.round(performance.now() - execution.started),
+                  usage: execution.usage,
+                  toolCalls: [...execution.tools],
                   time: timeStr,
                 }
                 setMessages((prev) => [...prev, debugMsg])

@@ -175,6 +175,10 @@ func RegisterPublicRoutes(mux *http.ServeMux, store Postgres, sessionSecret stri
 					}
 				}
 				if nonce == "" {
+					if action != "info" {
+						respond(w, 401, 40100, "Visitor session expired; reopen the application", nil)
+						return
+					}
 					nonce, err = randomID()
 					if err != nil {
 						respond(w, 503, 50300, "Session unavailable", nil)
@@ -185,11 +189,21 @@ func RegisterPublicRoutes(mux *http.ServeMux, store Postgres, sessionSecret stri
 				}
 				access.Slug = lookup
 				access.Scope = digest("web:" + access.ChannelID + ":" + nonce)
+				if action != "info" && (len(r.Header.Values("X-Visitor-Session")) != 1 || !hmac.Equal([]byte(r.Header.Get("X-Visitor-Session")), []byte(access.Scope))) {
+					respond(w, 401, 40100, "Visitor session changed; reopen the application", nil)
+					return
+				}
 			} else {
 				access.Scope = digest("api:" + access.ChannelID + ":" + access.APIHash)
 			}
 			if action == "info" {
-				respond(w, 200, 0, "success", target.Info)
+				var info map[string]any
+				if json.Unmarshal(target.Info, &info) != nil {
+					runHTTPError(w, ErrCapabilities)
+					return
+				}
+				info["sessionId"] = access.Scope
+				respond(w, 200, 0, "success", info)
 				return
 			}
 			var body []byte

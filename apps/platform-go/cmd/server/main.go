@@ -86,6 +86,13 @@ func run() error {
 			options.MaxConcurrent = parsed
 		}
 		platform.RegisterRunMetrics(mux, auth, store)
+		if value := os.Getenv("GO_PUBLIC_MAX_CONCURRENT"); value != "" {
+			parsed, err := strconv.Atoi(value)
+			if err != nil {
+				return errors.New("invalid GO_PUBLIC_MAX_CONCURRENT")
+			}
+			options.MaxPerChannel = parsed
+		}
 		if flags.public {
 			if err := platform.RegisterPublicRoutes(mux, store, os.Getenv("PUBLIC_SESSION_SECRET"), flags.secure); err != nil {
 				return err

@@ -48,6 +48,7 @@ func RegisterPersistentRunsWithOptions(mux *http.ServeMux, auth *Auth, store Run
 	client := &http.Client{Transport: &http.Transport{Proxy: nil, ResponseHeaderTimeout: 10 * time.Second, MaxConnsPerHost: 32, MaxIdleConnsPerHost: 16, IdleConnTimeout: 60 * time.Second}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	active := &activeRuns{cancel: map[string]context.CancelFunc{}}
 	slots := make(chan struct{}, options.MaxConcurrent)
+	channels := channelAdmission{active: map[string]int{}, limit: options.MaxPerChannel}
 	mux.Handle("GET /api/agent-runs/{runId}", auth.RunMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
@@ -90,11 +91,21 @@ func RegisterPersistentRunsWithOptions(mux *http.ServeMux, auth *Auth, store Run
 			respond(w, 400, 40000, "请提供有效 Idempotency-Key、Agent 和消息", nil)
 			return
 		}
+		if access := publicAccess(r.Context()); access != nil {
+			release, ok := channels.acquire(access.ChannelID)
+			if !ok {
+				w.Header().Set("Retry-After", "1")
+				respond(w, 429, 42900, "渠道运行并发已满", nil)
+				return
+			}
+			defer release()
+		}
 		select {
 		case slots <- struct{}{}:
 			defer func() { <-slots }()
 		default:
 			options.Logger.Warn("run.admission_rejected")
+			w.Header().Set("Retry-After", "1")
 			respond(w, 429, 42900, "运行并发已满", nil)
 			return
 		}

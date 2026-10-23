@@ -3,8 +3,9 @@ import { useParams } from 'react-router-dom';
 import { Alert, Button, Card, Input, Space, Spin, Typography } from 'antd';
 import { consumePublicStream, publicAgentURL, publicInfo } from '../../api/public-agent';
 import type { PublicAgentInfo } from '../../api/public-agent';
+import { checkStreamResponse, StreamHTTPError } from '../../api/public-stream';
 
-interface Submission { key: string; message: string; conversationId?: string; reply: number }
+interface Submission { key: string; message: string; conversationId?: string; reply: number; runId?: string }
 interface Message { role: 'user' | 'assistant'; text: string }
 
 export default function PublicAgentPage() {
@@ -20,6 +21,8 @@ function PublicChat({ slug }: { slug: string }) {
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [retry, setRetry] = useState<Submission>();
+  const [cooldown, setCooldown] = useState(0);
+  useEffect(() => { if (!cooldown) return; const timer = setTimeout(() => setCooldown(value => Math.max(0, value - 1)), 1000); return () => clearTimeout(timer); }, [cooldown]);
   const conversation = useRef<string | undefined>(undefined);
   const active = useRef<AbortController | null>(null);
   const visitor = useRef(crypto.randomUUID()); // Legacy NestJS namespace, never Go authorization.
@@ -30,34 +33,61 @@ function PublicChat({ slug }: { slug: string }) {
   }, [slug]);
 
   async function send(submission?: Submission) {
-    if (active.current || !info || (!submission && !text.trim())) return;
+    if (active.current || cooldown || !info || (!submission && !text.trim())) return;
     const request = submission ?? { key: crypto.randomUUID(), message: text.trim(), conversationId: conversation.current, reply: messages.length + 1 };
     if (!submission) { setMessages(previous => [...previous, { role: 'user', text: request.message }, { role: 'assistant', text: '' }]); setText(''); }
-    else setMessages(previous => previous.map((m, i) => i === request.reply ? { ...m, text: '' } : m));
     const controller = new AbortController(); active.current = controller;
     setBusy(true); setError(''); setRetry(undefined);
     let failed = false;
+    const sessionHeaders: Record<string, string> = info.sessionId ? { 'X-Visitor-Session': info.sessionId } : {};
+    const recover = async () => {
+      const response = await fetch(`${publicAgentURL(slug)}/runs/${encodeURIComponent(request.runId!)}`, { credentials: 'include', signal: controller.signal, headers: sessionHeaders });
+      await checkStreamResponse(response);
+      const { data: run } = await response.json();
+      if (run?.id !== request.runId || !['CREATED', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED'].includes(run.status)) throw new Error('运行查询返回了无效状态。');
+      if (run.conversationId) conversation.current = run.conversationId;
+      if (run.status === 'COMPLETED') {
+        if (typeof run.output !== 'string') throw new Error('运行结果不完整。');
+        setMessages(previous => previous.map((m, i) => i === request.reply ? { ...m, text: run.output } : m));
+        setRetry(undefined); setError('');
+      } else if (run.status === 'FAILED' || run.status === 'CANCELLED') {
+        setRetry(undefined); setText(request.message);
+        setError(run.status === 'CANCELLED' ? '原运行已取消。可编辑消息重新发送，新发送将创建新的运行。' : '原运行已失败。可编辑消息重新发送，新发送将创建新的运行。');
+      } else { setRetry(request); setCooldown(1); setError('原运行仍在执行，请稍后查询结果。'); }
+    };
     try {
+      if (submission?.runId && info.persistedRuns) { await recover(); return; }
+      if (submission) setMessages(previous => previous.map((m, i) => i === request.reply ? { ...m, text: '' } : m));
       const response = await fetch(`${publicAgentURL(slug)}/chat/stream`, {
         method: 'POST', credentials: 'include', signal: controller.signal,
-        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': request.key },
+        headers: { 'Content-Type': 'application/json', 'Idempotency-Key': request.key, ...sessionHeaders },
         body: JSON.stringify({ message: request.message, conversationId: request.conversationId, visitorId: visitor.current }),
       });
+      if (info.persistedRuns) request.runId = response.headers.get('X-Run-Id') ?? undefined;
       await consumePublicStream(response, event => {
         if (controller.signal.aborted) return;
-        if (event.type === 'run.created' && event.conversationId) conversation.current = event.conversationId;
+        if (event.type === 'run.created' && event.conversationId) { conversation.current = event.conversationId; request.runId = event.runId; }
         if (event.type === 'message.delta' || event.type === 'message.completed') setMessages(previous => previous.map((m, i) => i === request.reply ? { ...m, text: event.type === 'message.delta' ? m.text + (event.content ?? '') : (event.content ?? m.text) } : m));
         if (event.type === 'run.failed') { failed = true; setError(event.error || '运行失败，请开始新会话后重试。'); }
       });
       if (failed) setRetry(undefined);
     } catch (e) {
-      if (!controller.signal.aborted) { setError(e instanceof Error ? e.message : '请求失败'); if (info.persistedRuns) setRetry(request); }
+      if (!controller.signal.aborted) {
+        if (e instanceof StreamHTTPError && e.runId) request.runId = e.runId;
+        if (info.persistedRuns && request.runId && !submission?.runId && (!(e instanceof StreamHTTPError) || e.status === 409)) {
+          try { await recover(); return; } catch (recoveryError) { e = recoveryError; }
+        }
+        if (controller.signal.aborted) return;
+        setError(e instanceof Error ? e.message : '请求失败');
+        if (info.persistedRuns && (!(e instanceof StreamHTTPError) || e.status === 429 || e.status >= 500 || (e.status === 409 && request.runId))) setRetry(request);
+        if (e instanceof StreamHTTPError && e.status === 429) setCooldown(e.retryAfter);
+      }
     } finally {
       if (active.current === controller) { active.current = null; setBusy(false); }
     }
   }
 
-  function reset() { conversation.current = undefined; visitor.current = crypto.randomUUID(); setMessages([]); setRetry(undefined); setError(''); }
+  function reset() { conversation.current = undefined; visitor.current = crypto.randomUUID(); setMessages([]); setRetry(undefined); setText(''); setError(''); }
   return <main style={{ maxWidth: 840, margin: '0 auto', padding: 24 }}>
     <Typography.Title level={2}>{info?.name ?? '公开应用'}</Typography.Title>
     {info?.description && <Typography.Paragraph>{info.description}</Typography.Paragraph>}
@@ -71,9 +101,9 @@ function PublicChat({ slug }: { slug: string }) {
       <form onSubmit={e => { e.preventDefault(); void send(); }}>
         <Input.TextArea aria-label="消息" value={text} onChange={e => setText(e.target.value)} disabled={busy || !!retry} maxLength={8000} autoSize={{ minRows: 3, maxRows: 8 }} placeholder="输入消息" />
         <Space wrap style={{ marginTop: 12 }}>
-          <Button type="primary" htmlType="submit" disabled={!text.trim() || busy || !!retry}>发送</Button>
+          <Button type="primary" htmlType="submit" disabled={!text.trim() || busy || !!retry || cooldown > 0}>发送</Button>
           {busy && <Button onClick={() => { active.current?.abort(); setError('已停止接收回答。'); }}>停止</Button>}
-          {retry && <Button disabled={busy} onClick={() => void send(retry)}>重试本次请求</Button>}
+          {retry && <Button disabled={busy || cooldown > 0} onClick={() => void send(retry)}>{cooldown > 0 ? `${cooldown} 秒后重试` : retry.runId ? '查询运行结果' : '重试本次请求'}</Button>}
           <Button disabled={busy} onClick={reset}>新会话</Button>
         </Space>
       </form>

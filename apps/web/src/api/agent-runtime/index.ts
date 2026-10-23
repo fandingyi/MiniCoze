@@ -1,3 +1,4 @@
+import { consumePublicStream } from '../public-stream';
 
 
 import { API_BASE_URL, getAuthToken } from '../http';
@@ -20,6 +21,7 @@ export type RuntimeEventType =
   | 'message.completed'
   | 'tool.call.created'
   | 'tool.call.completed'
+  | 'tool.call.failed'
   | 'knowledge.status'
   | 'run.completed'
   | 'run.failed'
@@ -69,7 +71,7 @@ export interface ToolCallCreatedEvent {
 }
 
 export interface ToolCallCompletedEvent {
-  type: 'tool.call.completed';
+  type: 'tool.call.completed' | 'tool.call.failed';
   runId: string;
   toolCallId: string;
   name: string;
@@ -167,65 +169,7 @@ export async function runAgentStream(
     }),
     signal: controller.signal,
   })
-    .then(async (response) => {
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => response.statusText);
-        callbacks.onError(new Error(`请求失败: ${response.status} ${errorText}`));
-        return;
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) {
-        callbacks.onError(new Error('无法读取响应流'));
-        return;
-      }
-
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let currentEventType = '';
-      let currentData = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-
-          // 空行表示事件结束，处理累积的数据
-          if (trimmed === '') {
-            if (currentData) {
-              try {
-                const event = JSON.parse(currentData) as RuntimeEvent;
-                callbacks.onEvent(event);
-              } catch {
-                // skip unparseable data
-              }
-            }
-            currentEventType = '';
-            currentData = '';
-            continue;
-          }
-
-          // 解析 event 类型
-          if (trimmed.startsWith('event:')) {
-            currentEventType = trimmed.slice(6).trim();
-            continue;
-          }
-
-          // 累积 data 字段（支持多行 data）
-          if (trimmed.startsWith('data:')) {
-            const dataContent = trimmed.slice(5);
-            currentData = currentData ? currentData + '\n' + dataContent : dataContent;
-            continue;
-          }
-        }
-      }
-    })
+    .then(response => consumePublicStream(response, event => callbacks.onEvent(event as RuntimeEvent)))
     .catch((err) => {
       if (err instanceof DOMException && err.name === 'AbortError') {
         return;
