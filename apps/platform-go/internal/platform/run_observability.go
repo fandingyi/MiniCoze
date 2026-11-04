@@ -196,6 +196,10 @@ func RegisterRunMetrics(mux *http.ServeMux, auth *Auth, store RoundStore) {
 func RunReaper(ctx context.Context, store RunStore, interval time.Duration, logger *slog.Logger) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	pruner, canPrune := store.(interface {
+		PrunePublicQuotas(context.Context) (int64, error)
+	})
+	nextQuotaPrune := time.Time{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -211,6 +215,17 @@ func RunReaper(ctx context.Context, store RunStore, interval time.Duration, logg
 				logger.Warn("run.reaper_failed")
 			} else if n > 0 {
 				logger.Info("run.reaped", "count", n)
+			}
+			if canPrune && !time.Now().Before(nextQuotaPrune) {
+				pruneCtx, pruneCancel := context.WithTimeout(ctx, 5*time.Second)
+				removed, pruneErr := pruner.PrunePublicQuotas(pruneCtx)
+				pruneCancel()
+				nextQuotaPrune = time.Now().Add(time.Hour)
+				if pruneErr != nil {
+					logger.Warn("public_quota.prune_failed")
+				} else if removed > 0 {
+					logger.Info("public_quota.pruned", "count", removed)
+				}
 			}
 		}
 	}

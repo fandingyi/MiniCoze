@@ -10,12 +10,17 @@ export async function checkStreamResponse(response: Response) {
   if (response.ok) return;
   const payload = await response.json().catch(() => null);
   const id = payload?.data?.id;
-  const delay = Number(response.headers.get('Retry-After'));
-  throw new StreamHTTPError(response.status, typeof id === 'string' ? id : undefined, Number.isFinite(delay) && delay > 0 ? Math.min(delay, 60) : 1);
+  throw new StreamHTTPError(response.status, typeof id === 'string' ? id : undefined, retryDelay(response.headers.get('Retry-After')));
+}
+
+export function retryDelay(value: string | null, now = Date.now()): number {
+  const raw = value?.trim() ?? '';
+  const seconds = /^\d+$/.test(raw) ? Number(raw) : /^[A-Za-z]{3},/.test(raw) ? Math.ceil((Date.parse(raw) - now) / 1000) : NaN;
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : 1;
 }
 
 // Bound buffering and reject truncated success: a closed socket is not completion.
-export async function consumePublicStream(response: Response, onEvent: (event: PublicEvent) => void) {
+export async function consumePublicStream(response: Response, onEvent: (event: PublicEvent) => void, expectedRunId = response.headers.get('X-Run-Id') ?? undefined) {
   await checkStreamResponse(response);
   if (!response.headers.get('content-type')?.includes('text/event-stream') || !response.body) throw new Error('服务返回了无效的响应。');
   const reader = response.body.getReader();
@@ -37,6 +42,7 @@ export async function consumePublicStream(response: Response, onEvent: (event: P
           if (data.length) {
             const event: PublicEvent = JSON.parse(data.join('\n'));
             if (!event || !types.has(event.type) || typeof event.runId !== 'string' || !event.runId) throw new Error('响应事件格式错误。');
+            if (expectedRunId && event.runId !== expectedRunId) throw new Error('响应头与事件的运行身份不一致。');
             if (!runId) {
               if (event.type !== 'run.created' && event.type !== 'run.failed') throw new Error('缺少运行开始事件。');
               runId = event.runId;

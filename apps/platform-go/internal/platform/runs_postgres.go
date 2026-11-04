@@ -219,6 +219,9 @@ func (p Postgres) BeginRun(ctx context.Context, user, key string, input RunSubmi
 	if busy {
 		return run, false, ErrRunBusy
 	}
+	if err = acquirePublicQuota(ctx, tx, access); err != nil {
+		return run, false, err
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT m."role",LEFT(m."content",32000) FROM "Message" m LEFT JOIN "AgentRun" r ON r."id"=m."runId" WHERE m."conversationId"=$1 AND m."role" IN ('USER','ASSISTANT') AND (m."runId" IS NULL OR r."status"='COMPLETED') ORDER BY m."createdAt" DESC,m."id" DESC LIMIT $2`, run.ConversationID, snapshot.ContextLimit)
 	if err != nil {
 		return run, false, err

@@ -58,7 +58,7 @@ Vite 开发环境已提供可选开关 `VITE_GO_API_PROXY_TARGET=http://127.0.0.
 
 ## 第七天发布与公开运行
 
-持久化链路支持发布快照中的只读工具与知识库权限；NestJS 新发布会写入知识库范围，旧快照缺失该字段时不补读草稿。额外开启 `GO_PUBLIC_RUNS=true`，配置独立的 `PUBLIC_SESSION_SECRET`（至少 32 字符）后可启用公开入口。WEB 使用带有效期的签名 HttpOnly Cookie 隔离访客，API 使用既有渠道 Key；请求必须携带 Idempotency-Key。
+持久化链路支持发布快照中的只读工具与知识库权限；NestJS 新发布会写入知识库范围，旧快照缺失该字段时不补读草稿。额外开启 `GO_PUBLIC_RUNS=true`，配置独立的 `PUBLIC_SESSION_SECRET`（至少 32 字符）后可启用公开入口。WEB 使用带有效期的签名 HttpOnly Cookie 隔离访客，API 使用既有渠道 Key；请求必须携带 Idempotency-Key。公开入口会执行发布渠道的 WEB 匿名开关、来源白名单，以及 API 来源/IP 白名单；IP 仅按直连地址校验，不信任转发请求头。
 
 Vite 公开切流另需 `VITE_GO_PUBLIC_PROXY_ENABLED=true`，默认关闭。HTTPS 保持 `PUBLIC_COOKIE_SECURE=true`。不迁移旧匿名会话，需要开始新会话。接口、启用顺序、基线和回退演练详见 [第七天记录](../../docs/plans/day-7-publish-public.md)。
 

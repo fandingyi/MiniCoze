@@ -109,6 +109,9 @@ func run() error {
 		if err == nil {
 			_, err = db.ExecContext(check, `SELECT "runId" FROM "AgentModelRound" LIMIT 0`)
 		}
+		if err == nil {
+			_, err = db.ExecContext(check, `SELECT "channelId" FROM "PublishChannelQuota" LIMIT 0`)
+		}
 		stopCheck()
 		if err != nil {
 			return errors.New("persistent run schema unavailable; apply Prisma migrations first")

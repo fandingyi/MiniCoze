@@ -679,11 +679,24 @@ model PublishChannel {
   updatedAt   DateTime           @updatedAt
 
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  quotas    PublishChannelQuota[]
 
   @@unique([targetType, targetId, channel])
   @@index([workspaceId])
   @@index([targetType, targetId])
   @@index([channel, enabled])
+}
+
+model PublishChannelQuota {
+  channelId   String
+  bucket      String
+  bucketStart DateTime @db.Timestamp(3)
+  count       Int      @default(0)
+
+  channel PublishChannel @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@id([channelId, bucket, bucketStart])
+  @@index([bucket, bucketStart])
 }
 
 model KnowledgeBase {

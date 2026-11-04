@@ -10,7 +10,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -26,6 +28,10 @@ type PublicAccess struct {
 	OwnerID   string `json:"owner_id"`
 	Scope     string `json:"scope"`
 	APIHash   string `json:"api_hash,omitempty"`
+	// Limits are derived from the server-owned publish-channel config. They are
+	// intentionally not serialized into the immutable run snapshot.
+	RateLimitPerMinute int `json:"-"`
+	RateLimitPerDay    int `json:"-"`
 }
 
 func publicAccess(ctx context.Context) *PublicAccess {
@@ -74,18 +80,124 @@ func checkPublicAccess(ctx context.Context, q rowQuerier, a *PublicAccess) error
 			return ErrForbidden
 		}
 	}
+	policy, err := publicPolicy(kind, config)
+	if err != nil {
+		return err
+	}
+	a.RateLimitPerMinute = policy.RateLimitPerMinute
+	a.RateLimitPerDay = policy.RateLimitPerDay
 	return nil
 }
 
 type PublicTarget struct {
 	Access PublicAccess
 	Info   json.RawMessage
+	Policy PublicPolicy
+}
+
+// Publish channel settings are authorization constraints, not UI-only metadata.
+// Origin constrains browser callers; IP constraints use the immediate peer only
+// because this server does not trust forwarded client-address headers.
+type PublicPolicy struct {
+	AllowAnonymous     bool
+	AllowedOrigins     []string
+	AllowedIPs         []string
+	RateLimitPerMinute int
+	RateLimitPerDay    int
+}
+
+func publicPolicy(kind string, raw []byte) (PublicPolicy, error) {
+	policy := PublicPolicy{AllowAnonymous: kind == "WEB"}
+	if kind == "API" {
+		// Keep the Go gateway aligned with the channel-management defaults.
+		policy.RateLimitPerMinute = 60
+		policy.RateLimitPerDay = 1000
+	}
+	var config struct {
+		AllowAnonymous     *bool    `json:"allowAnonymous"`
+		AllowedOrigins     []string `json:"allowedOrigins"`
+		AllowedIPs         []string `json:"allowedIps"`
+		RateLimitPerMinute *int     `json:"rateLimitPerMinute"`
+		RateLimitPerDay    *int     `json:"rateLimitPerDay"`
+	}
+	if json.Unmarshal(raw, &config) != nil {
+		return policy, ErrCapabilities
+	}
+	if config.AllowAnonymous != nil {
+		policy.AllowAnonymous = *config.AllowAnonymous
+	}
+	if config.RateLimitPerMinute != nil {
+		if *config.RateLimitPerMinute < 1 || *config.RateLimitPerMinute > 10000 {
+			return policy, ErrCapabilities
+		}
+		policy.RateLimitPerMinute = *config.RateLimitPerMinute
+	}
+	if config.RateLimitPerDay != nil {
+		if *config.RateLimitPerDay < 1 || *config.RateLimitPerDay > 1000000 {
+			return policy, ErrCapabilities
+		}
+		policy.RateLimitPerDay = *config.RateLimitPerDay
+	}
+	for _, origin := range config.AllowedOrigins {
+		if origin == "" || (origin != "*" && !strings.HasPrefix(origin, "https://") && !strings.HasPrefix(origin, "http://")) {
+			return policy, ErrCapabilities
+		}
+		policy.AllowedOrigins = append(policy.AllowedOrigins, origin)
+	}
+	for _, cidr := range config.AllowedIPs {
+		if _, err := netip.ParsePrefix(cidr); err != nil {
+			if _, err := netip.ParseAddr(cidr); err != nil {
+				return policy, ErrCapabilities
+			}
+		}
+		policy.AllowedIPs = append(policy.AllowedIPs, cidr)
+	}
+	return policy, nil
+}
+
+func (p PublicPolicy) allowsRequest(kind string, request *http.Request) bool {
+	if kind == "WEB" && !p.AllowAnonymous {
+		return false
+	}
+	if origin := request.Header.Get("Origin"); origin != "" && len(p.AllowedOrigins) > 0 {
+		allowed := false
+		for _, value := range p.AllowedOrigins {
+			if value == "*" || value == origin {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return false
+		}
+	}
+	if kind != "API" || len(p.AllowedIPs) == 0 {
+		return true
+	}
+	host, _, err := net.SplitHostPort(request.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		return false
+	}
+	for _, value := range p.AllowedIPs {
+		if prefix, err := netip.ParsePrefix(value); err == nil && prefix.Contains(address) {
+			return true
+		}
+		if exact, err := netip.ParseAddr(value); err == nil && exact == address {
+			return true
+		}
+	}
+	return false
 }
 
 func (p Postgres) resolvePublic(ctx context.Context, kind, lookup string) (PublicTarget, error) {
 	target := PublicTarget{}
 	var snapshot []byte
-	rows, err := p.DB.QueryContext(ctx, `SELECT c."id",a."id",a."creatorId",v."snapshot" FROM "PublishChannel" c JOIN "Agent" a ON a."id"=c."targetId" AND a."workspaceId"=c."workspaceId" JOIN "AgentVersion" v ON v."id"=a."currentVersionId" AND v."agentId"=a."id" WHERE c."targetType"='AGENT' AND c."channel"::text=$1 AND c."enabled"=true AND a."status"='ACTIVE' AND c."config"->>$2=$3 LIMIT 2`, kind, map[string]string{"WEB": "slug", "API": "apiKeyHash"}[kind], lookup)
+	var config []byte
+	rows, err := p.DB.QueryContext(ctx, `SELECT c."id",a."id",a."creatorId",c."config",v."snapshot" FROM "PublishChannel" c JOIN "Agent" a ON a."id"=c."targetId" AND a."workspaceId"=c."workspaceId" JOIN "AgentVersion" v ON v."id"=a."currentVersionId" AND v."agentId"=a."id" WHERE c."targetType"='AGENT' AND c."channel"::text=$1 AND c."enabled"=true AND a."status"='ACTIVE' AND c."config"->>$2=$3 LIMIT 2`, kind, map[string]string{"WEB": "slug", "API": "apiKeyHash"}[kind], lookup)
 	if err != nil {
 		return target, err
 	}
@@ -93,7 +205,7 @@ func (p Postgres) resolvePublic(ctx context.Context, kind, lookup string) (Publi
 	count := 0
 	for rows.Next() {
 		count++
-		if err = rows.Scan(&target.Access.ChannelID, &target.Access.AgentID, &target.Access.OwnerID, &snapshot); err != nil {
+		if err = rows.Scan(&target.Access.ChannelID, &target.Access.AgentID, &target.Access.OwnerID, &config, &snapshot); err != nil {
 			return target, err
 		}
 	}
@@ -105,6 +217,9 @@ func (p Postgres) resolvePublic(ctx context.Context, kind, lookup string) (Publi
 	}
 	if kind == "API" {
 		target.Access.APIHash = lookup
+	}
+	if target.Policy, err = publicPolicy(kind, config); err != nil {
+		return target, err
 	}
 	if err = checkPublicAccess(ctx, p.DB, &target.Access); err != nil {
 		return target, err
@@ -159,6 +274,10 @@ func RegisterPublicRoutes(mux *http.ServeMux, store Postgres, sessionSecret stri
 				} else {
 					runHTTPError(w, err)
 				}
+				return
+			}
+			if !target.Policy.allowsRequest(kind, r) {
+				respond(w, 403, 40300, "Publish channel policy denied this request", nil)
 				return
 			}
 			access := target.Access

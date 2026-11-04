@@ -22,7 +22,7 @@ func testPublishedPublic(t *testing.T, store Postgres) {
 			t.Fatal(err)
 		}
 	}
-	exec(`ALTER TABLE "Agent" ADD COLUMN "creatorId" text DEFAULT 'u1'; CREATE TABLE "PublishChannel"("id" text PRIMARY KEY,"workspaceId" text,"targetId" text,"targetType" text,"channel" text,"enabled" boolean,"config" jsonb)`)
+	exec(`ALTER TABLE "Agent" ADD COLUMN "creatorId" text DEFAULT 'u1'; CREATE TABLE "PublishChannel"("id" text PRIMARY KEY,"workspaceId" text,"targetId" text,"targetType" text,"channel" text,"enabled" boolean,"config" jsonb); CREATE TABLE "PublishChannelQuota"("channelId" text NOT NULL,"bucket" text NOT NULL,"bucketStart" timestamp(3) NOT NULL,"count" integer NOT NULL, PRIMARY KEY("channelId","bucket","bucketStart"))`)
 	snapshot := `{"agent":{"id":"tool-agent","workspaceId":"w1","name":"Published demo","model":"test-model","systemPrompt":"frozen prompt","temperature":0.5,"contextLimit":4},"plugins":[{"pluginId":"plugin","pluginCode":"system_tools","status":"ACTIVE","autoInvoke":true,"config":{},"tools":[{"type":"function","function":{"name":"system_tools__echo_text"}}]}],"knowledge":[{"knowledgeBaseId":"kb","name":"Docs","enabled":true}],"workflows":[],"channels":[]}`
 	exec(`INSERT INTO "AgentVersion" VALUES('v7','tool-agent',$1)`, snapshot)
 	exec(`UPDATE "Agent" SET "currentVersionId"='v7',"systemPrompt"='changed draft',"model"='changed-model' WHERE "id"='tool-agent'`)
@@ -183,6 +183,77 @@ func testPublishedPublic(t *testing.T, store Postgres) {
 	if w := request("POST", apiPath, "public-same-key", `{"message":"api"}`, nil, "test-api-key-day-seven"); w.Code != 200 {
 		t.Fatal("api", w.Code, w.Body.String())
 	}
+	// Publish settings must constrain requests before a Run is created, not merely
+	// appear in the management UI.
+	exec(`UPDATE "PublishChannel" SET "config"=$1 WHERE "id"='api7'`, fmt.Sprintf(`{"apiKeyHash":%q,"allowedOrigins":["https://allowed.example"],"allowedIps":["203.0.113.0/24"]}`, digest("test-api-key-day-seven")))
+	policyRequest := func(origin, remote string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("POST", apiPath, strings.NewReader(`{"message":"policy"}`))
+		r.Header.Set("Authorization", "Bearer test-api-key-day-seven")
+		r.Header.Set("Idempotency-Key", "api-policy-"+digest(origin + remote)[:16])
+		r.Header.Set("Origin", origin)
+		r.RemoteAddr = remote
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, r)
+		return w
+	}
+	if w := policyRequest("https://blocked.example", "203.0.113.5:443"); w.Code != 403 {
+		t.Fatal("API origin policy", w.Code, w.Body.String())
+	}
+	if w := policyRequest("https://allowed.example", "198.51.100.5:443"); w.Code != 403 {
+		t.Fatal("API IP policy", w.Code, w.Body.String())
+	}
+	if w := policyRequest("https://allowed.example", "203.0.113.5:443"); w.Code != 200 {
+		t.Fatal("API allowed policy", w.Code, w.Body.String())
+	}
+	exec(`UPDATE "PublishChannel" SET "config"=$1 WHERE "id"='api7'`, fmt.Sprintf(`{"apiKeyHash":%q}`, digest("test-api-key-day-seven")))
+	// Quota reservation happens only for a new Run. Replaying the same
+	// idempotency key must reuse the Run without taking another slot.
+	exec(`DELETE FROM "PublishChannelQuota" WHERE "channelId"='api7'`)
+	exec(`UPDATE "PublishChannel" SET "config"=$1 WHERE "id"='api7'`, fmt.Sprintf(`{"apiKeyHash":%q,"rateLimitPerMinute":2,"rateLimitPerDay":3}`, digest("test-api-key-day-seven")))
+	for _, key := range []string{"api-quota-one", "api-quota-two"} {
+		if w := request("POST", apiPath, key, `{"message":"quota"}`, nil, "test-api-key-day-seven"); w.Code != 200 {
+			t.Fatal("API quota acceptance", key, w.Code, w.Body.String())
+		}
+	}
+	if w := request("POST", apiPath, "api-quota-one", `{"message":"quota"}`, nil, "test-api-key-day-seven"); w.Code != 200 || w.Header().Get("Idempotency-Replayed") != "true" {
+		t.Fatal("API quota idempotent replay", w.Code, w.Header().Get("Idempotency-Replayed"))
+	}
+	if w := request("POST", apiPath, "api-quota-three", `{"message":"quota"}`, nil, "test-api-key-day-seven"); w.Code != 429 || w.Header().Get("Retry-After") == "" {
+		t.Fatal("API minute quota", w.Code, w.Header().Get("Retry-After"), w.Body.String())
+	}
+	var minuteCount, dayCount int
+	if err := store.DB.QueryRow(`SELECT COALESCE(MAX("count") FILTER (WHERE "bucket"='minute'),0),COALESCE(MAX("count") FILTER (WHERE "bucket"='day'),0) FROM "PublishChannelQuota" WHERE "channelId"='api7'`).Scan(&minuteCount, &dayCount); err != nil || minuteCount != 2 || dayCount != 2 {
+		t.Fatal("API durable quota counters", err, minuteCount, dayCount)
+	}
+	// The longer bucket is checked in the same transaction. Reset the isolated
+	// test rows so its rejection cannot be masked by the lower minute limit.
+	exec(`DELETE FROM "PublishChannelQuota" WHERE "channelId"='api7'`)
+	exec(`UPDATE "PublishChannel" SET "config"=$1 WHERE "id"='api7'`, fmt.Sprintf(`{"apiKeyHash":%q,"rateLimitPerMinute":10,"rateLimitPerDay":2}`, digest("test-api-key-day-seven")))
+	for _, key := range []string{"api-day-quota-one", "api-day-quota-two"} {
+		if w := request("POST", apiPath, key, `{"message":"day quota"}`, nil, "test-api-key-day-seven"); w.Code != 200 {
+			t.Fatal("API daily quota acceptance", key, w.Code, w.Body.String())
+		}
+	}
+	if w := request("POST", apiPath, "api-day-quota-three", `{"message":"day quota"}`, nil, "test-api-key-day-seven"); w.Code != 429 || w.Header().Get("Retry-After") == "" {
+		t.Fatal("API daily quota", w.Code, w.Header().Get("Retry-After"), w.Body.String())
+	}
+	if err := store.DB.QueryRow(`SELECT COALESCE(MAX("count") FILTER (WHERE "bucket"='minute'),0),COALESCE(MAX("count") FILTER (WHERE "bucket"='day'),0) FROM "PublishChannelQuota" WHERE "channelId"='api7'`).Scan(&minuteCount, &dayCount); err != nil || minuteCount != 2 || dayCount != 2 {
+		t.Fatal("API daily durable quota counters", err, minuteCount, dayCount)
+	}
+	exec(`INSERT INTO "PublishChannelQuota"("channelId","bucket","bucketStart","count") VALUES('quota-prune','minute',CURRENT_TIMESTAMP AT TIME ZONE 'UTC'-interval '3 days',1),('quota-prune','day',CURRENT_TIMESTAMP AT TIME ZONE 'UTC'-interval '91 days',1),('quota-prune','day',CURRENT_TIMESTAMP AT TIME ZONE 'UTC',1)`)
+	if removed, err := store.PrunePublicQuotas(ctx); err != nil || removed != 2 {
+		t.Fatal("public quota pruning", removed, err)
+	}
+	var retained int
+	if err := store.DB.QueryRow(`SELECT count(*) FROM "PublishChannelQuota" WHERE "channelId"='quota-prune'`).Scan(&retained); err != nil || retained != 1 {
+		t.Fatal("public quota retention", retained, err)
+	}
+	exec(`UPDATE "PublishChannel" SET "config"=$1 WHERE "id"='api7'`, fmt.Sprintf(`{"apiKeyHash":%q}`, digest("test-api-key-day-seven")))
+	exec(`UPDATE "PublishChannel" SET "config"='{"slug":"demo","allowAnonymous":false}' WHERE "id"='web7'`)
+	if w := request("GET", "/api/public/agents/demo", "", "", nil, ""); w.Code != 403 {
+		t.Fatal("WEB anonymous policy", w.Code, w.Body.String())
+	}
+	exec(`UPDATE "PublishChannel" SET "config"='{"slug":"demo"}' WHERE "id"='web7'`)
 	gateway := httptest.NewServer(mux)
 	client := &http.Client{Timeout: 5 * time.Second}
 	activeRequest, _ := http.NewRequest("POST", gateway.URL+apiPath, strings.NewReader(`{"message":"api-wait","visitorId":"customer-a"}`))

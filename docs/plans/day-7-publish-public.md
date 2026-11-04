@@ -107,7 +107,7 @@ Python：在 `apps/agent-runtime-python` 运行 `.venv/Scripts/python.exe -m pyt
 
 测试同时断言模型调用数等于完成数，429 请求不创建 Run，成功流各有一次 run.completed 和 stream.done。首次运行发现统计 SQL 将数据库角色 ASSISTANT 写成小写，修正统计后重新运行通过。指标描述的是这个受控负载；不代表真实模型的延迟、TTFT、最大容量或生产 SLA。
 
-机器可读报告：[public-load.json](../../artifacts/day-7/public-load.json)。复现时，在 `apps/platform-go` 执行：
+机器可读报告：[public-load.json](../../artifacts/day-7/public-load.json)（保存最近一次结果；2026-10-27 回归数据见 [聊天可靠性补充](chat-reliability.md)，上表保留历史记录）。复现时，在 `apps/platform-go` 执行：
 
 ```powershell
 $env:RUN_POSTGRES_INTEGRATION='1'

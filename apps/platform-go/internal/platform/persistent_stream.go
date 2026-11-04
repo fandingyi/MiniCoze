@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -406,7 +407,18 @@ func emitRunResult(emit eventEmitter, run AgentRun) {
 	_ = emit("stream.done", map[string]any{})
 }
 func runHTTPError(w http.ResponseWriter, err error) {
+	var rateLimit *PublicRateLimitError
 	switch {
+	case errors.As(err, &rateLimit):
+		seconds := int(rateLimit.RetryAfter.Seconds())
+		if rateLimit.RetryAfter%time.Second != 0 {
+			seconds++
+		}
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+		respond(w, 429, 42901, "Publish channel request quota exceeded", nil)
 	case errors.Is(err, ErrNotFound):
 		respond(w, 404, 40400, "资源不存在或无权访问", nil)
 	case errors.Is(err, ErrForbidden):
