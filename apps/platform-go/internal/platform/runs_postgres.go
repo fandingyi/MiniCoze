@@ -337,6 +337,13 @@ func (p Postgres) FinishRun(ctx context.Context, id, status string, result RunRe
 	if _, err = tx.ExecContext(ctx, `UPDATE "Conversation" SET "updatedAt"=NOW() WHERE "id"=$1`, run.ConversationID); err != nil {
 		return run, err
 	}
+	// pg_notify is transactional: remote instances are told to close their
+	// local Python connection only after the CANCELLED state is committed.
+	if status == "CANCELLED" {
+		if _, err = tx.ExecContext(ctx, `SELECT pg_notify($1,$2)`, runCancellationChannel, run.ID); err != nil {
+			return run, err
+		}
+	}
 	run, err = scanRun(tx.QueryRowContext(ctx, `SELECT `+runColumns+` FROM "AgentRun" r WHERE r."id"=$1`, id))
 	if err != nil {
 		return run, err

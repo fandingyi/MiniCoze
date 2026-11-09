@@ -5,6 +5,7 @@ export interface PendingPublicRun {
   reply: number;
   conversationId?: string;
   runId?: string;
+  lastEventId?: string;
   createdAt: number;
 }
 
@@ -26,6 +27,7 @@ function valid(value: unknown, now: number): value is PendingPublicRun {
     && typeof run.reply === 'number' && Number.isInteger(run.reply) && run.reply >= 1 && run.reply <= 10000
     && (run.conversationId == null || (typeof run.conversationId === 'string' && run.conversationId.length <= 128))
     && (run.runId == null || (typeof run.runId === 'string' && run.runId.length > 0 && run.runId.length <= 128))
+    && (run.lastEventId == null || (typeof run.lastEventId === 'string' && /^[^:\s]{1,128}:\d+$/.test(run.lastEventId)))
     && typeof run.createdAt === 'number' && Number.isFinite(run.createdAt)
     && run.createdAt <= now + 60 * 1000 && now - run.createdAt <= maxAge;
 }

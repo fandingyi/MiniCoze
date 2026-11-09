@@ -4,10 +4,10 @@ import { Alert, Button, Card, Input, Space, Spin, Typography } from 'antd';
 import { consumePublicStream, publicAgentURL, publicInfo } from '../../api/public-agent';
 import type { PublicAgentInfo } from '../../api/public-agent';
 import { StreamHTTPError } from '../../api/public-stream';
-import { publicRun } from '../../api/public-run';
+import { publicRun, replayPublicRunEvents } from '../../api/public-run';
 import { clearPendingPublicRun, publicRunSessionStorage, readPendingPublicRun, writePendingPublicRun } from '../../api/public-run-recovery';
 
-interface Submission { key: string; message: string; conversationId?: string; reply: number; runId?: string }
+interface Submission { key: string; message: string; conversationId?: string; reply: number; runId?: string; lastEventId?: string }
 interface Message { role: 'user' | 'assistant'; text: string }
 
 export default function PublicAgentPage() {
@@ -29,6 +29,30 @@ function PublicChat({ slug }: { slug: string }) {
   const active = useRef<AbortController | null>(null);
   const visitor = useRef(crypto.randomUUID()); // Legacy NestJS namespace, never Go authorization.
   const restored = useRef(false);
+  const pendingDeltas = useRef(new Map<number, string>());
+  const pendingDeltaFrame = useRef<number | undefined>(undefined);
+  const flushDeltas = () => {
+    if (pendingDeltaFrame.current != null) {
+      cancelAnimationFrame(pendingDeltaFrame.current);
+      pendingDeltaFrame.current = undefined;
+    }
+    if (!pendingDeltas.current.size) return;
+    const deltas = pendingDeltas.current;
+    pendingDeltas.current = new Map();
+    setMessages(previous => previous.map((message, index) => {
+      const delta = deltas.get(index);
+      return delta == null ? message : { ...message, text: message.text + delta };
+    }));
+  };
+  const queueDelta = (reply: number, content: string) => {
+    pendingDeltas.current.set(reply, (pendingDeltas.current.get(reply) ?? '') + content);
+    if (pendingDeltaFrame.current == null) pendingDeltaFrame.current = requestAnimationFrame(flushDeltas);
+  };
+  const discardDeltas = () => {
+    if (pendingDeltaFrame.current != null) cancelAnimationFrame(pendingDeltaFrame.current);
+    pendingDeltaFrame.current = undefined;
+    pendingDeltas.current.clear();
+  };
   const remember = (request: Submission) => {
     const storage = publicRunSessionStorage();
     if (storage) writePendingPublicRun(storage, slug, { version: 1, ...request, createdAt: Date.now() });
@@ -40,7 +64,7 @@ function PublicChat({ slug }: { slug: string }) {
   useEffect(() => {
     const controller = new AbortController();
     publicInfo(slug, controller.signal).then(setInfo).catch(e => { if (!controller.signal.aborted) setError(e.message); });
-    return () => { controller.abort(); active.current?.abort(); };
+    return () => { controller.abort(); active.current?.abort(); discardDeltas(); };
   }, [slug]);
   useEffect(() => {
     if (!info?.persistedRuns || restored.current) return;
@@ -90,6 +114,20 @@ function PublicChat({ slug }: { slug: string }) {
     let failed = false;
     const sessionHeaders: Record<string, string> = info.sessionId ? { 'X-Visitor-Session': info.sessionId } : {};
     const recover = async () => {
+      // Fill the visible answer from durable frames first. A failed catch-up is
+      // harmless here: the following status query is still authoritative.
+      try {
+        await replayPublicRunEvents(publicAgentURL(slug), request.runId!, info.sessionId, request.lastEventId, controller.signal, event => {
+          if (event.eventId) { request.lastEventId = event.eventId; remember(request); }
+          if (event.type === 'message.delta') queueDelta(request.reply, event.content ?? '');
+          if (event.type === 'message.completed') {
+            flushDeltas();
+            setMessages(previous => previous.map((m, i) => i === request.reply ? { ...m, text: event.content ?? m.text } : m));
+          }
+        });
+      } catch {
+        // Status recovery below gives the user a deterministic outcome.
+      }
       const run = await publicRun(publicAgentURL(slug), request.runId!, info.sessionId, controller.signal, cancel);
       if (run.conversationId) conversation.current = run.conversationId;
       if (run.status === 'COMPLETED') {
@@ -110,11 +148,21 @@ function PublicChat({ slug }: { slug: string }) {
         headers: { 'Content-Type': 'application/json', 'Idempotency-Key': request.key, ...sessionHeaders },
         body: JSON.stringify({ message: request.message, conversationId: request.conversationId, visitorId: visitor.current }),
       });
-      if (info.persistedRuns) request.runId = response.headers.get('X-Run-Id') ?? undefined;
+      if (info.persistedRuns) {
+        request.runId = response.headers.get('X-Run-Id') ?? undefined;
+        // The header can arrive before the first SSE frame. Persist it now so
+        // a disconnect in that window still leaves query/cancel available.
+        if (request.runId) remember(request);
+      }
       await consumePublicStream(response, event => {
         if (controller.signal.aborted) return;
+        if (event.eventId) { request.lastEventId = event.eventId; if (info.persistedRuns) remember(request); }
         if (event.type === 'run.created' && event.conversationId) { conversation.current = event.conversationId; request.runId = event.runId; if (info.persistedRuns) remember(request); }
-        if (event.type === 'message.delta' || event.type === 'message.completed') setMessages(previous => previous.map((m, i) => i === request.reply ? { ...m, text: event.type === 'message.delta' ? m.text + (event.content ?? '') : (event.content ?? m.text) } : m));
+        if (event.type === 'message.delta') queueDelta(request.reply, event.content ?? '');
+        if (event.type === 'message.completed') {
+          flushDeltas();
+          setMessages(previous => previous.map((m, i) => i === request.reply ? { ...m, text: event.content ?? m.text } : m));
+        }
         if (event.type === 'run.failed') { failed = true; setError(event.error || '运行失败，请开始新会话后重试。'); }
       }, info.persistedRuns ? request.runId : undefined);
       if (failed) { forget(); setRetry(undefined); setText(request.message); }
@@ -141,7 +189,7 @@ function PublicChat({ slug }: { slug: string }) {
     }
   }
 
-  function reset() { forget(); conversation.current = undefined; visitor.current = crypto.randomUUID(); setMessages([]); setRetry(undefined); setText(''); setError(''); }
+  function reset() { discardDeltas(); forget(); conversation.current = undefined; visitor.current = crypto.randomUUID(); setMessages([]); setRetry(undefined); setText(''); setError(''); }
   return <main style={{ maxWidth: 840, margin: '0 auto', padding: 24 }}>
     <Typography.Title level={2}>{info?.name ?? '公开应用'}</Typography.Title>
     {info?.description && <Typography.Paragraph>{info.description}</Typography.Paragraph>}

@@ -8,10 +8,51 @@ import (
 	"errors"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
-type Postgres struct{ DB *sql.DB }
+type Postgres struct {
+	DB  *sql.DB
+	DSN string // Dedicated pgx connections use this for LISTEN/NOTIFY.
+}
+
+const runCancellationChannel = "minicoze_run_cancel"
+
+// ListenRunCancellations is best-effort latency reduction, not state
+// authority: the per-run database watcher remains in place so a notification
+// lost during reconnect cannot leave a run executing indefinitely.
+func (p Postgres) ListenRunCancellations(ctx context.Context, onCancel func(string)) {
+	if p.DSN == "" || onCancel == nil {
+		return
+	}
+	for ctx.Err() == nil {
+		conn, err := pgx.Connect(ctx, p.DSN)
+		if err == nil {
+			_, err = conn.Exec(ctx, "LISTEN "+runCancellationChannel)
+		}
+		if err == nil {
+			for ctx.Err() == nil {
+				notification, waitErr := conn.WaitForNotification(ctx)
+				if waitErr != nil {
+					break
+				}
+				if notification.Channel == runCancellationChannel && len(notification.Payload) > 0 && len(notification.Payload) <= 128 {
+					onCancel(notification.Payload)
+				}
+			}
+		}
+		if conn != nil {
+			_ = conn.Close(context.Background())
+		}
+		if ctx.Err() == nil {
+			select {
+			case <-ctx.Done():
+			case <-time.After(time.Second):
+			}
+		}
+	}
+}
 
 func mapNoRows(err error) error {
 	if errors.Is(err, sql.ErrNoRows) {

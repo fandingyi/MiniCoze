@@ -378,15 +378,20 @@ func RegisterPublicRoutes(mux *http.ServeMux, store Postgres, sessionSecret stri
 			if action == "cancel" {
 				cloned.URL.Path += "/cancel"
 			}
+			if action == "events" {
+				cloned.URL.Path += "/events"
+			}
 			mux.ServeHTTP(w, cloned)
 		}
 	}
 	mux.HandleFunc("GET /api/public/agents/{slug}", handler("WEB", "info"))
 	mux.HandleFunc("POST /api/public/agents/{slug}/chat/stream", handler("WEB", "stream"))
 	mux.HandleFunc("GET /api/public/agents/{slug}/runs/{runId}", handler("WEB", "query"))
+	mux.HandleFunc("GET /api/public/agents/{slug}/runs/{runId}/events", handler("WEB", "events"))
 	mux.HandleFunc("POST /api/public/agents/{slug}/runs/{runId}/cancel", handler("WEB", "cancel"))
 	mux.HandleFunc("POST /api/public/agent-runs/stream", handler("API", "stream"))
 	mux.HandleFunc("GET /api/public/agent-runs/{runId}", handler("API", "query"))
+	mux.HandleFunc("GET /api/public/agent-runs/{runId}/events", handler("API", "events"))
 	mux.HandleFunc("POST /api/public/agent-runs/{runId}/cancel", handler("API", "cancel"))
 	return nil
 }

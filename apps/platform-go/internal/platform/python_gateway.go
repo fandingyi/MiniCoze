@@ -199,6 +199,12 @@ func (s *eventState) validate(e runtimeEnvelope) error {
 		if _, ok := stringField("error"); !ok {
 			return errors.New("missing error")
 		}
+		if code, exists := e.Payload["code"]; exists {
+			value, ok := code.(string)
+			if !ok || value == "" || len(value) > 64 {
+				return errors.New("invalid failure code")
+			}
+		}
 		s.phase = "terminal"
 	case "stream.done":
 		if s.phase != "terminal" {

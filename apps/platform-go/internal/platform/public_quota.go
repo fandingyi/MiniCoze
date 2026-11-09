@@ -22,6 +22,9 @@ type publicQuotaBucket struct {
 	RetryAfter time.Duration
 }
 
+const publicQuotaPruneBatchSize = 1000
+const publicQuotaPruneMaxBatches = 10
+
 func publicQuotaBuckets(access *PublicAccess, now time.Time) []publicQuotaBucket {
 	if access == nil || access.APIHash == "" {
 		return nil
@@ -71,11 +74,40 @@ func acquirePublicQuota(ctx context.Context, tx *sql.Tx, access *PublicAccess) e
 // PrunePublicQuotas retains enough history for operational diagnosis without
 // letting the high-cardinality minute buckets grow indefinitely.
 func (p Postgres) PrunePublicQuotas(ctx context.Context) (int64, error) {
-	result, err := p.DB.ExecContext(ctx, `DELETE FROM "PublishChannelQuota"
-		WHERE ("bucket"='minute' AND "bucketStart" < date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - interval '2 days')
-		   OR ("bucket"='day' AND "bucketStart" < date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - interval '90 days')`)
+	tx, err := p.DB.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
-	return result.RowsAffected()
+	defer tx.Rollback()
+	var leader bool
+	if err = tx.QueryRowContext(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended($1,0))`, "public-quota-prune").Scan(&leader); err != nil {
+		return 0, err
+	}
+	if !leader {
+		return 0, tx.Commit()
+	}
+	var removed int64
+	for range publicQuotaPruneMaxBatches {
+		result, err := tx.ExecContext(ctx, `WITH expired AS (
+			SELECT ctid FROM "PublishChannelQuota"
+			WHERE ("bucket"='minute' AND "bucketStart" < date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - interval '2 days')
+			   OR ("bucket"='day' AND "bucketStart" < date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'UTC') - interval '90 days')
+			ORDER BY "bucketStart"
+			LIMIT $1
+			FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM "PublishChannelQuota" quota USING expired WHERE quota.ctid=expired.ctid`, publicQuotaPruneBatchSize)
+		if err != nil {
+			return removed, err
+		}
+		count, err := result.RowsAffected()
+		if err != nil {
+			return removed, err
+		}
+		removed += count
+		if count < publicQuotaPruneBatchSize {
+			break
+		}
+	}
+	return removed, tx.Commit()
 }

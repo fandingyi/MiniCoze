@@ -20,12 +20,12 @@ export function retryDelay(value: string | null, now = Date.now()): number {
 }
 
 // Bound buffering and reject truncated success: a closed socket is not completion.
-export async function consumePublicStream(response: Response, onEvent: (event: PublicEvent) => void, expectedRunId = response.headers.get('X-Run-Id') ?? undefined) {
+export async function consumePublicStream(response: Response, onEvent: (event: PublicEvent) => void, expectedRunId = response.headers.get('X-Run-Id') ?? undefined, allowResume = false) {
   await checkStreamResponse(response);
   if (!response.headers.get('content-type')?.includes('text/event-stream') || !response.body) throw new Error('服务返回了无效的响应。');
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
-  let buffer = '', data: string[] = [], size = 0, terminal = false, done = false, runId = '';
+  let buffer = '', data: string[] = [], size = 0, terminal = false, done = false, runId = '', eventId = '';
   const types = new Set(['run.created', 'run.in_progress', 'message.delta', 'message.completed', 'tool.call.created', 'tool.call.completed', 'tool.call.failed', 'knowledge.status', 'run.completed', 'run.failed', 'stream.done']);
   try {
     while (!done) {
@@ -42,9 +42,10 @@ export async function consumePublicStream(response: Response, onEvent: (event: P
           if (data.length) {
             const event: PublicEvent = JSON.parse(data.join('\n'));
             if (!event || !types.has(event.type) || typeof event.runId !== 'string' || !event.runId) throw new Error('响应事件格式错误。');
+            if (eventId) event.eventId = eventId;
             if (expectedRunId && event.runId !== expectedRunId) throw new Error('响应头与事件的运行身份不一致。');
             if (!runId) {
-              if (event.type !== 'run.created' && event.type !== 'run.failed') throw new Error('缺少运行开始事件。');
+              if (!allowResume && event.type !== 'run.created' && event.type !== 'run.failed') throw new Error('缺少运行开始事件。');
               runId = event.runId;
             } else if (event.runId !== runId || event.type === 'run.created') throw new Error('运行身份或事件顺序错误。');
             if (terminal && event.type !== 'stream.done') throw new Error('终态之后出现额外事件。');
@@ -56,11 +57,13 @@ export async function consumePublicStream(response: Response, onEvent: (event: P
             onEvent(event);
           }
           data = []; size = 0;
+          eventId = '';
           if (done) break;
-        } else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
+        } else if (line.startsWith('id:')) eventId = line.slice(3).trim();
+        else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''));
       }
       if (buffer.length + size > 2 * 1024 * 1024) throw new Error('响应事件过大。');
     }
-    if (!done) throw new Error('连接中断，结果尚未确认。');
+    if (!done && !allowResume) throw new Error('连接中断，结果尚未确认。');
   } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
 }

@@ -51,7 +51,7 @@ func run() error {
 	if err != nil {
 		return errors.New("database unavailable; verify DATABASE_URL and connectivity")
 	}
-	store := platform.Postgres{DB: db}
+	store := platform.Postgres{DB: db, DSN: dsn}
 	auth, err := platform.NewAuth(store, os.Getenv("JWT_SECRET"), ttl)
 	if err != nil {
 		return err
@@ -111,6 +111,9 @@ func run() error {
 		}
 		if err == nil {
 			_, err = db.ExecContext(check, `SELECT "channelId" FROM "PublishChannelQuota" LIMIT 0`)
+		}
+		if err == nil {
+			_, err = db.ExecContext(check, `SELECT "runId","sequence" FROM "AgentRunEvent" LIMIT 0`)
 		}
 		stopCheck()
 		if err != nil {

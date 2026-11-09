@@ -76,7 +76,12 @@ func TestPostgresRunLifecycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	exec(string(migration))
-	store := Postgres{DB: db}
+	migration, err = os.ReadFile("../../../backend/prisma/migrations/20261109093000_add_agent_run_events/migration.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec(string(migration))
+	store := Postgres{DB: db, DSN: dsn}
 	ctx := context.Background()
 	input := RunSubmission{AgentID: "a1", Message: "hello", Preview: true}
 	var wg sync.WaitGroup
@@ -122,6 +127,12 @@ func TestPostgresRunLifecycle(t *testing.T) {
 	run, err = store.StartRun(ctx, id)
 	if err != nil || run.Snapshot.Instructions != "original" {
 		t.Fatal("snapshot changed", err)
+	}
+	if err = store.AppendRunEvent(ctx, StoredRunEvent{RunID: id, Sequence: 1, Type: "run.created", Payload: map[string]any{"conversationId": run.ConversationID}}); err != nil {
+		t.Fatal(err)
+	}
+	if events, err := store.ListRunEvents(ctx, "u1", id, 0); err != nil || len(events) != 1 || events[0].Type != "run.created" {
+		t.Fatalf("event persistence: %+v %v", events, err)
 	}
 	next := input
 	next.ConversationID = run.ConversationID
@@ -272,6 +283,22 @@ func testPersistentHTTP(t *testing.T, store Postgres) {
 	}
 	if w := request("GET", "/api/agent-runs/"+id, "", ""); w.Code != 200 {
 		t.Fatal("query", w.Code)
+	}
+	replayEvents := httptest.NewRequest("GET", "/api/agent-runs/"+id+"/events", nil)
+	replayEvents.Header.Set("Authorization", "Bearer "+token)
+	replayEvents.Header.Set("Last-Event-ID", id+":1")
+	eventResponse := httptest.NewRecorder()
+	mux.ServeHTTP(eventResponse, replayEvents)
+	if eventResponse.Code != 200 || strings.Contains(eventResponse.Body.String(), "id: "+id+":1\n") || !strings.Contains(eventResponse.Body.String(), "event: stream.done\n") {
+		t.Fatalf("event replay: %d %s", eventResponse.Code, eventResponse.Body.String())
+	}
+	badEventID := httptest.NewRequest("GET", "/api/agent-runs/"+id+"/events", nil)
+	badEventID.Header.Set("Authorization", "Bearer "+token)
+	badEventID.Header.Set("Last-Event-ID", "other:1")
+	badResponse := httptest.NewRecorder()
+	mux.ServeHTTP(badResponse, badEventID)
+	if badResponse.Code != 400 {
+		t.Fatal("invalid event id accepted", badResponse.Code)
 	}
 	if w := request("POST", "/api/agent-runs/"+id+"/cancel", "", ""); !strings.Contains(w.Body.String(), "COMPLETED") {
 		t.Fatal("terminal replaced")

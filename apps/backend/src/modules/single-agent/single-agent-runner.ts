@@ -7,6 +7,9 @@ import type {
 } from '../../shared/types/runtime';
 import { AiGatewayService } from '../ai-gateway/ai-gateway.service';
 
+const MAX_AGENT_ROUNDS = 5;
+const MAX_TOOL_CALLS_PER_RUN = 16;
+
 @Injectable()
 export class SingleAgentRunner implements AgentExecutionStrategy {
   readonly mode = 'single_agent' as const;
@@ -20,7 +23,8 @@ export class SingleAgentRunner implements AgentExecutionStrategy {
   }: AgentExecutionInput): AsyncGenerator<RuntimeEvent, string, void> {
     const tools = context.agentConfig.tools ?? [];
 
-    for (;;) {
+    let executedToolCalls = 0;
+    for (let round = 1; round <= MAX_AGENT_ROUNDS; round += 1) {
       const assistantMessageId = randomUUID();
       const stream = this.aiGateway.chatStream({
         messages,
@@ -61,6 +65,13 @@ export class SingleAgentRunner implements AgentExecutionStrategy {
         return finalContent;
       }
 
+      if (round === MAX_AGENT_ROUNDS) {
+        throw new Error('AGENT_MAX_ROUNDS_EXCEEDED');
+      }
+      if (executedToolCalls + toolCalls.length > MAX_TOOL_CALLS_PER_RUN) {
+        throw new Error('AGENT_TOOL_CALL_LIMIT_EXCEEDED');
+      }
+
       messages.push({
         role: 'assistant',
         content: finalContent || null,
@@ -68,6 +79,7 @@ export class SingleAgentRunner implements AgentExecutionStrategy {
       });
 
       for (const toolCall of toolCalls) {
+        executedToolCalls += 1;
         const parsedArgs = this.maskPreviewArgs(
           this.safeParse(toolCall.function.arguments),
         );
@@ -117,6 +129,8 @@ export class SingleAgentRunner implements AgentExecutionStrategy {
         }
       }
     }
+
+    throw new Error('AGENT_MAX_ROUNDS_EXCEEDED');
   }
 
   private safeParse(value: string): unknown {

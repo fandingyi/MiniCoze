@@ -57,7 +57,7 @@ func executionFailure(request, execution context.Context, deliveryBroken bool) (
 // responses, prompts, arguments, output text, credentials or raw errors.
 func safeRunCode(code string) string {
 	switch code {
-	case "MODEL_ERROR", "MODEL_TIMEOUT", "TOOL_GATEWAY_ERROR", "TOOL_TIMEOUT", "RUN_TIMEOUT", "RUNTIME_PROTOCOL_ERROR", "RUN_CANCELLED", "CLIENT_DISCONNECTED", "CLIENT_WRITE_FAILED", "RUN_ACCESS_REVOKED", "RUN_STATUS_UNAVAILABLE", "SERVICE_SHUTDOWN", "RUN_EXPIRED", "RUN_INTERRUPTED", "RUNTIME_UNAVAILABLE", "RUNTIME_HEADER_TIMEOUT", "RUNTIME_REJECTED", "RUN_INPUT_TOO_LARGE", "RUNTIME_CONFIG_ERROR", "RUN_PERSISTENCE_ERROR", "ROUND_PERSISTENCE_ERROR":
+	case "MODEL_ERROR", "MODEL_TIMEOUT", "TOOL_GATEWAY_ERROR", "TOOL_TIMEOUT", "RUN_TIMEOUT", "RUNTIME_PROTOCOL_ERROR", "RUN_CANCELLED", "CLIENT_DISCONNECTED", "CLIENT_WRITE_FAILED", "RUN_ACCESS_REVOKED", "RUN_STATUS_UNAVAILABLE", "SERVICE_SHUTDOWN", "RUN_EXPIRED", "RUN_INTERRUPTED", "RUNTIME_UNAVAILABLE", "RUNTIME_HEADER_TIMEOUT", "RUNTIME_REJECTED", "RUN_INPUT_TOO_LARGE", "RUNTIME_CONFIG_ERROR", "RUN_PERSISTENCE_ERROR", "ROUND_PERSISTENCE_ERROR", "AGENT_MAX_ROUNDS_EXCEEDED", "AGENT_TOOL_CALL_LIMIT_EXCEEDED":
 		return code
 	default:
 		return "RUNTIME_ERROR"
@@ -223,8 +223,12 @@ func RunReaper(ctx context.Context, store RunStore, interval time.Duration, logg
 				nextQuotaPrune = time.Now().Add(time.Hour)
 				if pruneErr != nil {
 					logger.Warn("public_quota.prune_failed")
+					nextQuotaPrune = time.Now().Add(time.Minute)
 				} else if removed > 0 {
 					logger.Info("public_quota.pruned", "count", removed)
+					if removed >= publicQuotaPruneBatchSize*publicQuotaPruneMaxBatches {
+						nextQuotaPrune = time.Now().Add(time.Minute)
+					}
 				}
 			}
 		}

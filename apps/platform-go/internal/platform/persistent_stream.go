@@ -48,6 +48,11 @@ func RegisterPersistentRunsWithOptions(mux *http.ServeMux, auth *Auth, store Run
 	}
 	client := &http.Client{Transport: &http.Transport{Proxy: nil, ResponseHeaderTimeout: 10 * time.Second, MaxConnsPerHost: 32, MaxIdleConnsPerHost: 16, IdleConnTimeout: 60 * time.Second}, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	active := &activeRuns{cancel: map[string]context.CancelFunc{}}
+	if subscriber, ok := store.(interface {
+		ListenRunCancellations(context.Context, func(string))
+	}); ok {
+		go subscriber.ListenRunCancellations(options.Lifecycle, active.stop)
+	}
 	slots := make(chan struct{}, options.MaxConcurrent)
 	channels := channelAdmission{active: map[string]int{}, limit: options.MaxPerChannel}
 	mux.Handle("GET /api/agent-runs/{runId}", auth.RunMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -60,6 +65,31 @@ func RegisterPersistentRunsWithOptions(mux *http.ServeMux, auth *Auth, store Run
 			return
 		}
 		respond(w, 200, 0, "success", run)
+	})))
+	mux.Handle("GET /api/agent-runs/{runId}/events", auth.RunMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := r.Context().Value(userKey{}).(User)
+		after, err := parseLastEventID(r, r.PathValue("runId"))
+		if err != nil {
+			respond(w, 400, 40000, "Invalid Last-Event-ID", nil)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+		if _, err = store.GetRun(ctx, user.ID, r.PathValue("runId")); err != nil {
+			runHTTPError(w, err)
+			return
+		}
+		events, ok := store.(RunEventStore)
+		if !ok {
+			respond(w, 503, 50000, "Run event storage unavailable", nil)
+			return
+		}
+		stored, err := events.ListRunEvents(ctx, user.ID, r.PathValue("runId"), after)
+		if err != nil {
+			runHTTPError(w, err)
+			return
+		}
+		writeStoredEvents(w, stored)
 	})))
 	mux.Handle("POST /api/agent-runs/{runId}/cancel", auth.RunMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -139,7 +169,7 @@ func RegisterPersistentRunsWithOptions(mux *http.ServeMux, auth *Auth, store Run
 				respond(w, 409, 40900, "运行仍在执行，请查询已有 Run", run)
 				return
 			}
-			_, emit := runEmitter(w, run.ID)
+			_, emit := runEmitter(w, nil, run.ID)
 			defer http.NewResponseController(w).SetWriteDeadline(time.Time{})
 			_ = emit("run.created", map[string]any{"conversationId": run.ConversationID})
 			if run.Status == "COMPLETED" {
@@ -176,7 +206,7 @@ func RegisterPersistentRunsWithOptions(mux *http.ServeMux, auth *Auth, store Run
 			return
 		}
 		run = started
-		_, emit := runEmitter(w, run.ID)
+		_, emit := runEmitter(w, store, run.ID)
 		defer http.NewResponseController(w).SetWriteDeadline(time.Time{})
 		if err := emit("run.created", map[string]any{"conversationId": run.ConversationID}); err != nil {
 			_, _ = finishDetached(store, run.ID, "CANCELLED", RunResult{ErrorCode: "RUN_CANCELLED"})
@@ -241,9 +271,9 @@ func RegisterPersistentRunsWithOptions(mux *http.ServeMux, auth *Auth, store Run
 				code = safeRunCode(*saved.ErrorCode)
 			}
 			options.Logger.Info("run.terminal", "run_id", run.ID, "status", saved.Status, "code", code, "duration_ms", time.Since(requestStarted).Milliseconds())
-			if r.Context().Err() == nil {
-				emitRunResult(emit, saved)
-			}
+			// Persist terminal frames even if the original browser has gone away;
+			// the reconnect endpoint can then deliver the exact terminal outcome.
+			emitRunResult(emit, saved)
 		}
 		remaining := time.Until(deadline) - min(5*time.Second, options.Timeout/10)
 		if remaining < 100*time.Millisecond {
@@ -364,7 +394,7 @@ func RegisterPersistentRunsWithOptions(mux *http.ServeMux, auth *Auth, store Run
 
 type eventEmitter func(string, map[string]any) error
 
-func runEmitter(w http.ResponseWriter, id string) (*streamWriter, eventEmitter) {
+func runEmitter(w http.ResponseWriter, store RunStore, id string) (*streamWriter, eventEmitter) {
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -379,7 +409,49 @@ func runEmitter(w http.ResponseWriter, id string) (*streamWriter, eventEmitter) 
 	}
 	return writer, func(kind string, payload map[string]any) error {
 		sequence++
-		return writeGatewayEvent(writer, runtimeEnvelope{1, fmt.Sprintf("%s:%d", eventPrefix, sequence), id, sequence, time.Now().UTC().Format(time.RFC3339Nano), kind, payload})
+		event := runtimeEnvelope{1, fmt.Sprintf("%s:%d", eventPrefix, sequence), id, sequence, time.Now().UTC().Format(time.RFC3339Nano), kind, payload}
+		if events, ok := store.(RunEventStore); ok && eventPrefix == id {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err := events.AppendRunEvent(ctx, StoredRunEvent{RunID: id, Sequence: sequence, Type: kind, Payload: payload})
+			cancel()
+			if err != nil {
+				return err
+			}
+		}
+		return writeGatewayEvent(writer, event)
+	}
+}
+
+func parseLastEventID(r *http.Request, runID string) (int, error) {
+	values := r.Header.Values("Last-Event-ID")
+	if len(values) == 0 || values[0] == "" {
+		return 0, nil
+	}
+	if len(values) != 1 {
+		return 0, errors.New("duplicate Last-Event-ID")
+	}
+	parts := strings.Split(values[0], ":")
+	if len(parts) != 2 || parts[0] != runID {
+		return 0, errors.New("invalid Last-Event-ID")
+	}
+	sequence, err := strconv.Atoi(parts[1])
+	if err != nil || sequence < 0 {
+		return 0, errors.New("invalid Last-Event-ID")
+	}
+	return sequence, nil
+}
+
+func writeStoredEvents(w http.ResponseWriter, events []StoredRunEvent) {
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("X-Run-Persistence", "postgres")
+	writer := &streamWriter{ResponseWriter: w}
+	defer http.NewResponseController(w).SetWriteDeadline(time.Time{})
+	for _, event := range events {
+		if err := writeGatewayEvent(writer, runtimeEnvelope{1, fmt.Sprintf("%s:%d", event.RunID, event.Sequence), event.RunID, event.Sequence, event.CreatedAt.UTC().Format(time.RFC3339Nano), event.Type, event.Payload}); err != nil {
+			return
+		}
 	}
 }
 func emitRunResult(emit eventEmitter, run AgentRun) {

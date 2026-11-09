@@ -1,7 +1,7 @@
 import { API_BASE_URL } from './http';
 
 export interface PublicAgentInfo { name: string; description: string | null; openingMessage: string | null; persistedRuns?: boolean; sessionId?: string }
-export interface PublicEvent { type: string; runId?: string; conversationId?: string; content?: string; error?: string }
+export interface PublicEvent { type: string; runId?: string; eventId?: string; conversationId?: string; content?: string; error?: string; code?: string }
 export const publicAgentURL = (slug: string) => `${API_BASE_URL.replace(/\/$/, '')}/public/agents/${encodeURIComponent(slug)}`;
 
 export async function publicInfo(slug: string, signal: AbortSignal): Promise<PublicAgentInfo> {

@@ -374,12 +374,27 @@ model AgentRun {
   messages     Message[]
   toolCalls    AgentToolCall[]
   modelRounds  AgentModelRound[]
+  events       AgentRunEvent[]
 
   @@unique([userId, requestKey])
   @@index([conversationId, createdAt])
   @@index([status, deadlineAt])
   // Migration additionally creates a partial unique index for one active run
   // per conversation and a trigger protecting snapshot/terminal immutability.
+}
+
+// Immutable delivery log for reconnecting an SSE client. The sequence is
+// allocated by the stream owner and is scoped to one persisted run.
+model AgentRunEvent {
+  runId     String
+  sequence  Int
+  type      String
+  payload   Json
+  createdAt DateTime @default(now())
+  run       AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@id([runId, sequence])
+  @@index([runId, createdAt])
 }
 
 model AgentModelRound {

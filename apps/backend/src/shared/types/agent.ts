@@ -132,7 +132,7 @@ export type RuntimeEvent =
       knowledge: KnowledgeBoundStatus;
     }
   | { type: 'run.completed'; runId: string; usage?: TokenUsage }
-  | { type: 'run.failed'; runId: string; error: string }
+  | { type: 'run.failed'; runId: string; error: string; code?: string }
   | { type: 'stream.done'; runId: string };
 
 export interface RunAgentCommand {
