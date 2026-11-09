@@ -1,8 +1,12 @@
-// Agent Runtime 流式对话 API — 对接后端 /agent-runs/stream SSE 端点
+import { consumePublicStream } from '../public-stream';
+
 
 import { API_BASE_URL, getAuthToken } from '../http';
+import { runAgentStreamMock } from './mock-stream';
 
-// ---- 后端 SSE 事件类型 ----
+const useMock = import.meta.env.VITE_USE_AUTH_MOCK === 'true';
+
+
 
 export interface TokenUsage {
   inputTokens: number;
@@ -17,6 +21,8 @@ export type RuntimeEventType =
   | 'message.completed'
   | 'tool.call.created'
   | 'tool.call.completed'
+  | 'tool.call.failed'
+  | 'knowledge.status'
   | 'run.completed'
   | 'run.failed'
   | 'stream.done';
@@ -30,6 +36,16 @@ export interface RunCreatedEvent {
 export interface RunInProgressEvent {
   type: 'run.in_progress';
   runId: string;
+}
+
+export type KnowledgeBoundStatus =
+  | { bound: false }
+  | { bound: true; knowledgeName: string; retrievedCount?: number };
+
+export interface KnowledgeStatusEvent {
+  type: 'knowledge.status';
+  runId: string;
+  knowledge: KnowledgeBoundStatus;
 }
 
 export interface MessageDeltaEvent {
@@ -55,11 +71,12 @@ export interface ToolCallCreatedEvent {
 }
 
 export interface ToolCallCompletedEvent {
-  type: 'tool.call.completed';
+  type: 'tool.call.completed' | 'tool.call.failed';
   runId: string;
   toolCallId: string;
   name: string;
   result: unknown;
+  error?: string;
 }
 
 export interface RunCompletedEvent {
@@ -82,6 +99,7 @@ export interface StreamDoneEvent {
 export type RuntimeEvent =
   | RunCreatedEvent
   | RunInProgressEvent
+  | KnowledgeStatusEvent
   | MessageDeltaEvent
   | MessageCompletedEvent
   | ToolCallCreatedEvent
@@ -90,9 +108,11 @@ export type RuntimeEvent =
   | RunFailedEvent
   | StreamDoneEvent;
 
-// ---- 请求参数 ----
+
 
 export interface RunAgentParams {
+  /** Reuse only for the same logical request. */
+  idempotencyKey?: string;
   agentId: string;
   message: string;
   conversationId?: string;
@@ -101,21 +121,28 @@ export interface RunAgentParams {
   systemPrompt?: string;
   temperature?: number;
   maxTokens?: number;
+  knowledgeBaseId?: string;
+  tools?: Array<{ type: 'function'; function: { name: string; description: string; parameters: Record<string, unknown> } }>;
 }
 
-// ---- 回调 ----
+
 
 export interface RunAgentCallbacks {
   onEvent: (event: RuntimeEvent) => void;
   onError: (error: Error) => void;
 }
 
-// ---- SSE 流式函数 ----
+
 
 export async function runAgentStream(
   params: RunAgentParams,
   callbacks: RunAgentCallbacks,
 ): Promise<AbortController> {
+  // Mock 模式下使用模拟流
+  if (useMock) {
+    return runAgentStreamMock(params, callbacks);
+  }
+
   const token = getAuthToken();
   const controller = new AbortController();
 
@@ -125,6 +152,7 @@ export async function runAgentStream(
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
+      'Idempotency-Key': params.idempotencyKey ?? crypto.randomUUID(),
       ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     body: JSON.stringify({
@@ -136,54 +164,12 @@ export async function runAgentStream(
       systemPrompt: params.systemPrompt,
       temperature: params.temperature,
       maxTokens: params.maxTokens,
+      knowledgeBaseId: params.knowledgeBaseId,
+      tools: params.tools,
     }),
     signal: controller.signal,
   })
-    .then(async (response) => {
-      if (!response.ok) {
-        const errorText = await response.text().catch(() => response.statusText);
-        callbacks.onError(new Error(`请求失败: ${response.status} ${errorText}`));
-        return;
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) {
-        callbacks.onError(new Error('无法读取响应流'));
-        return;
-      }
-
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() ?? '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-
-          if (trimmed.startsWith('event:')) {
-            continue;
-          }
-
-          if (trimmed.startsWith('data:')) {
-            const dataStr = trimmed.slice(5).trim();
-            if (!dataStr) continue;
-
-            try {
-              const event = JSON.parse(dataStr) as RuntimeEvent;
-              callbacks.onEvent(event);
-            } catch {
-              // skip unparseable data
-            }
-          }
-        }
-      }
-    })
+    .then(response => consumePublicStream(response, event => callbacks.onEvent(event as RuntimeEvent)))
     .catch((err) => {
       if (err instanceof DOMException && err.name === 'AbortError') {
         return;

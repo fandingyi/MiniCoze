@@ -12,70 +12,122 @@ import type {
 } from '../types';
 import type { AiProviderInterface } from './ai-provider.interface';
 
+const PROVIDER_TIMEOUT_MS = 110_000;
+const MAX_UNFINISHED_SSE_BYTES = 1024 * 1024;
+
+interface ProviderRequest {
+  response: Response;
+  close(): void;
+}
+
 @Injectable()
 export class OpenAiProvider implements AiProviderInterface {
   constructor(private readonly config: AiProviderConfig) {}
 
   async generate(request: AiGenerateRequest): Promise<AiGenerateResponse> {
-    const response = await this.callApi(request, false);
-    const data = (await response.json()) as
-      | OpenAiApiCompletionResponse
-      | OpenAiApiErrorResponse;
+    const providerRequest = await this.callApi(request, false);
+    try {
+      const data = (await providerRequest.response.json()) as
+        | OpenAiApiCompletionResponse
+        | OpenAiApiErrorResponse;
 
-    if (!response.ok) {
-      this.handleApiError(data as OpenAiApiErrorResponse);
+      if (!providerRequest.response.ok) {
+        this.handleApiError(data as OpenAiApiErrorResponse);
+      }
+
+      return this.parseResponse(data as OpenAiApiCompletionResponse);
+    } finally {
+      providerRequest.close();
     }
-
-    return this.parseResponse(data as OpenAiApiCompletionResponse);
   }
 
   async *generateStream(
     request: AiGenerateRequest,
   ): AsyncGenerator<AiStreamChunk, void, unknown> {
-    const response = await this.callApi(request, true);
-
-    if (!response.ok) {
-      const data = (await response.json()) as OpenAiApiErrorResponse;
-      this.handleApiError(data);
-    }
-
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new BusinessException(
-        '无法读取流式响应',
-        ErrorCode.AiModelError,
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
-    }
-
-    const decoder = new TextDecoder('utf-8');
-    let buffer = '';
+    const providerRequest = await this.callApi(request, true);
+    const { response } = providerRequest;
 
     try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const chunk = this.parseStreamLine(line);
-          if (chunk) yield chunk;
-        }
+      if (!response.ok) {
+        const data = (await response.json()) as OpenAiApiErrorResponse;
+        this.handleApiError(data);
       }
 
-      if (buffer) {
-        const chunk = this.parseStreamLine(buffer);
-        if (chunk) yield chunk;
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new BusinessException(
+          '无法读取流式响应',
+          ErrorCode.AiModelError,
+          HttpStatus.INTERNAL_SERVER_ERROR,
+        );
+      }
+
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+      const toolCallState = new Map<
+        number | string,
+        { id?: string; type?: 'function'; name?: string; args: string }
+      >();
+
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          if (Buffer.byteLength(buffer, 'utf8') > MAX_UNFINISHED_SSE_BYTES) {
+            throw new BusinessException(
+              '模型流式响应过大或缺少事件边界',
+              ErrorCode.AiModelError,
+              HttpStatus.BAD_GATEWAY,
+            );
+          }
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            const chunk = this.parseStreamLine(line);
+            if (!chunk) continue;
+            const toolCalls = this.mergeToolCalls(
+              toolCallState,
+              chunk.toolCalls,
+            );
+            yield toolCalls
+              ? { ...chunk, toolCalls }
+              : chunk.toolCalls
+                ? { ...chunk, toolCalls: undefined }
+                : chunk;
+          }
+        }
+
+        buffer += decoder.decode();
+        if (buffer) {
+          const chunk = this.parseStreamLine(buffer);
+          if (chunk) {
+            const toolCalls = this.mergeToolCalls(
+              toolCallState,
+              chunk.toolCalls,
+            );
+            yield toolCalls
+              ? { ...chunk, toolCalls }
+              : chunk.toolCalls
+                ? { ...chunk, toolCalls: undefined }
+                : chunk;
+          }
+        }
+      } finally {
+        await reader.cancel().catch(() => undefined);
+        reader.releaseLock();
       }
     } finally {
-      reader.releaseLock();
+      providerRequest.close();
     }
   }
 
-  private async callApi(request: AiGenerateRequest, stream: boolean) {
+  private async callApi(
+    request: AiGenerateRequest,
+    stream: boolean,
+  ): Promise<ProviderRequest> {
     const url = `${this.config.baseUrl}/chat/completions`;
 
     const body = {
@@ -87,18 +139,31 @@ export class OpenAiProvider implements AiProviderInterface {
       stream,
     };
 
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), PROVIDER_TIMEOUT_MS);
+    const close = () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+
     try {
-      return await fetch(url, {
+      const response = await fetch(url, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${this.config.apiKey}`,
         },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
+      return { response, close };
     } catch (error) {
+      close();
+      const message = controller.signal.aborted
+        ? `模型请求超时（${PROVIDER_TIMEOUT_MS}ms）`
+        : `模型请求网络错误: ${error instanceof Error ? error.message : String(error)}`;
       throw new BusinessException(
-        `模型请求网络错误: ${error instanceof Error ? error.message : String(error)}`,
+        message,
         ErrorCode.AiModelError,
         HttpStatus.INTERNAL_SERVER_ERROR,
       );
@@ -153,6 +218,76 @@ export class OpenAiProvider implements AiProviderInterface {
     } catch {
       return null;
     }
+  }
+
+  private mergeToolCalls(
+    state: Map<
+      number | string,
+      { id?: string; type?: 'function'; name?: string; args: string }
+    >,
+    value: unknown,
+  ): AiStreamChunk['toolCalls'] | undefined {
+    if (!Array.isArray(value)) {
+      return undefined;
+    }
+
+    for (const item of value) {
+      if (!this.isRecord(item)) continue;
+      const key =
+        typeof item.index === 'number'
+          ? item.index
+          : typeof item.id === 'string'
+            ? item.id
+            : undefined;
+      if (key === undefined) continue;
+
+      const entry = state.get(key) ?? { args: '' };
+      if (typeof item.id === 'string') {
+        entry.id = item.id;
+      }
+      if (item.type === 'function') {
+        entry.type = 'function';
+      }
+
+      const functionCall: unknown = item.function;
+      if (this.isRecord(functionCall)) {
+        if (typeof functionCall.name === 'string') {
+          entry.name = functionCall.name;
+        }
+        if (typeof functionCall.arguments === 'string') {
+          entry.args += functionCall.arguments;
+        }
+      }
+
+      state.set(key, entry);
+    }
+
+    const merged = Array.from(state.entries())
+      .sort(([a], [b]) => {
+        if (typeof a === 'number' && typeof b === 'number') return a - b;
+        return String(a).localeCompare(String(b));
+      })
+      .map(([, entry]) => {
+        if (!entry.id || !entry.name) return null;
+        return {
+          id: entry.id,
+          type: entry.type ?? 'function',
+          function: {
+            name: entry.name,
+            arguments: entry.args,
+          },
+        };
+      })
+      .filter(
+        (item): item is NonNullable<AiStreamChunk['toolCalls']>[number] =>
+          item !== null,
+      );
+
+    return merged.length ? merged : undefined;
+  }
+
+  private isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null;
   }
 
   private handleApiError(data: OpenAiApiErrorResponse): never {

@@ -1,0 +1,15 @@
+{
+  "admission_limit": 4,
+  "assistant_messages": 1009,
+  "completed": 1009,
+  "completed_per_second": 33.15058675388633,
+  "duration_seconds": 30.436867,
+  "limited_429": 6816,
+  "remaining_active_runs": 0,
+  "scope": "localhost HTTP + disposable PostgreSQL + mock Runtime with 100ms delay; no real model",
+  "success_p50_ms": 106.208,
+  "success_p95_ms": 114.487,
+  "timestamp": "2026-10-27T15:25:34Z",
+  "unexpected_failures": 0,
+  "workers": 8
+}
